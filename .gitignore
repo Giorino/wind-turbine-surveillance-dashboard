@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+.DS_Store
+._*
+
+.streamlit/
+outputs/
+
+WT3/
+WT5/
+WT7/
+
+*.zip
