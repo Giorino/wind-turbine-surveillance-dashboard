@@ -8,6 +8,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from scipy.io import loadmat
 from scipy.signal import butter, detrend, filtfilt
 
 from .config import TURBINES, TurbineConfig
@@ -24,6 +25,10 @@ class AnalysisConfig:
     f0_high_hz: float = 0.34
     broadband_low_hz: float = 0.05
     broadband_high_hz: float = 0.45
+    low_frequency_band_low_hz: float = 0.05
+    low_frequency_band_high_hz: float = 0.25
+    resonance_band_low_hz: float = 0.25
+    resonance_band_high_hz: float = 0.35
     harmonic_bandwidth_hz: float = 0.020
     window_minutes: int = 10
     overlap: float = 0.50
@@ -37,6 +42,13 @@ class AnalysisConfig:
     drift_alert_hz_per_day: float = 0.001
     psd_min_hz: float = 0.05
     psd_max_hz: float = 0.80
+    use_reference_files: bool = True
+    reference_dir: str | None = None
+    fdd_segment_minutes: int = 30
+    fdd_overlap: float = 0.50
+    fdd_low_hz: float = 0.10
+    fdd_high_hz: float = 0.50
+    half_power_bandwidth_fraction: float = 0.707
 
     @property
     def turbine(self) -> TurbineConfig:
@@ -49,11 +61,24 @@ class AnalysisConfig:
 @dataclass
 class AnalysisResult:
     kpis: pd.DataFrame
+    weekly: pd.DataFrame
     summary: dict[str, object]
     psd_frequencies_hz: np.ndarray
     psd_ax_db: np.ndarray
     psd_ay_db: np.ndarray
     sample_rate_hz: int
+
+
+@dataclass(frozen=True)
+class ReferenceData:
+    path: Path
+    turbine_id: str | None
+    f0_ref_ax_hz: float
+    f0_ref_ay_hz: float
+    vbins: np.ndarray
+    thresholds: dict[str, np.ndarray]
+    fallback_thresholds: dict[str, float]
+    metadata: dict[str, object]
 
 
 def analyze_dataset(
@@ -93,18 +118,49 @@ def analyze_dataset(
         config=cfg,
     )
 
-    kpis, summary = _classify_windows(windows, sample_rate_hz, cfg)
+    reference = _load_reference_for_turbine(cfg)
+    kpis, summary = _classify_windows(windows, sample_rate_hz, cfg, reference)
+    fdd_summary = _fdd_modal_summary(
+        times_utc=times_utc,
+        ax_filtered=ax_filtered,
+        ay_filtered=ay_filtered,
+        kpis=kpis,
+        sample_rate_hz=sample_rate_hz,
+        config=cfg,
+    )
+    weekly = _weekly_modal_summary(
+        times_utc=times_utc,
+        ax_filtered=ax_filtered,
+        ay_filtered=ay_filtered,
+        kpis=kpis,
+        sample_rate_hz=sample_rate_hz,
+        config=cfg,
+    )
     summary.update(
         {
             "turbine_id": turbine.turbine_id.upper(),
             "sample_rate_hz": sample_rate_hz,
             "accelerometer_rows": int(len(acc)),
             "scada_rows": int(len(scada)),
+            **fdd_summary,
+            "weekly_count": int(len(weekly)),
         }
     )
+    if not weekly.empty:
+        latest_week = weekly.iloc[-1]
+        summary.update(
+            {
+                "latest_week_start_utc": latest_week["week_start_utc"].isoformat(),
+                "latest_week_end_utc": latest_week["week_end_utc"].isoformat(),
+                "latest_week_f0_ax_hz": _rounded(latest_week["f0_baseline_ax_hz"], 5),
+                "latest_week_f0_ay_hz": _rounded(latest_week["f0_baseline_ay_hz"], 5),
+                "latest_week_zeta_pct": _rounded(latest_week["zeta_fdd_pct"], 3),
+            }
+        )
 
     return AnalysisResult(
         kpis=kpis,
+        weekly=weekly,
         summary=summary,
         psd_frequencies_hz=psd_freqs,
         psd_ax_db=psd_ax_db,
@@ -134,6 +190,107 @@ def discover_scada_files(path: str | Path) -> list[Path]:
     if not root.exists():
         return []
     return sorted(p for p in root.glob("*.csv") if not p.name.startswith("._"))
+
+
+def _load_reference_for_turbine(cfg: AnalysisConfig) -> ReferenceData | None:
+    if not cfg.use_reference_files:
+        return None
+
+    root = (
+        Path(cfg.reference_dir)
+        if cfg.reference_dir
+        else Path(__file__).resolve().parents[1] / "reference-matlab-files"
+    )
+    if not root.exists():
+        return None
+
+    turbine_id = cfg.turbine_id.lower()
+    candidates = sorted(root.glob(f"REF_{turbine_id.upper()}_*.mat"))
+    if not candidates:
+        return None
+    path = max(candidates, key=lambda item: item.stat().st_mtime)
+
+    try:
+        mat = loadmat(path, squeeze_me=True, struct_as_record=False)
+    except Exception as exc:  # pragma: no cover - depends on external MATLAB files.
+        raise ValueError(f"Could not read reference file {path}: {exc}") from exc
+
+    def number(name: str) -> float:
+        if name not in mat:
+            return np.nan
+        arr = np.asarray(mat[name], dtype=float)
+        return float(arr.reshape(-1)[0]) if arr.size else np.nan
+
+    def vector(name: str) -> np.ndarray:
+        if name not in mat:
+            return np.array([], dtype=float)
+        return np.asarray(mat[name], dtype=float).reshape(-1)
+
+    threshold_names = (
+        "p95_ax",
+        "p99_ax",
+        "p95_ay",
+        "p99_ay",
+        "p95_bb",
+        "p99_bb",
+        "p95_bf_ax",
+        "p99_bf_ax",
+        "p95_bf_ay",
+        "p99_bf_ay",
+        "p95_res_ax",
+        "p99_res_ax",
+        "p95_res_ay",
+        "p99_res_ay",
+    )
+    fallback_names = (
+        "rep_ax95",
+        "rep_ax99",
+        "rep_ay95",
+        "rep_ay99",
+        "rep_bb95",
+        "rep_bb99",
+        "rep_bf_ax95",
+        "rep_bf_ax99",
+        "rep_bf_ay95",
+        "rep_bf_ay99",
+        "rep_res_ax95",
+        "rep_res_ax99",
+        "rep_res_ay95",
+        "rep_res_ay99",
+    )
+    metadata = _mat_struct_to_dict(mat.get("ref_meta"))
+    ref_turbine = str(metadata.get("turbine_id", "")).lower() or None
+    vbins = vector("vbins")
+    if vbins.size < 2:
+        vbins = np.array([3, 5, 7, 9, 11, np.inf], dtype=float)
+
+    return ReferenceData(
+        path=path,
+        turbine_id=ref_turbine,
+        f0_ref_ax_hz=number("f0_ref_ax"),
+        f0_ref_ay_hz=number("f0_ref_ay"),
+        vbins=vbins,
+        thresholds={name: vector(name) for name in threshold_names},
+        fallback_thresholds={name: number(name) for name in fallback_names},
+        metadata=metadata,
+    )
+
+
+def _mat_struct_to_dict(value: object) -> dict[str, object]:
+    if value is None or not hasattr(value, "_fieldnames"):
+        return {}
+    out: dict[str, object] = {}
+    for field_name in value._fieldnames:
+        field_value = getattr(value, field_name)
+        arr = np.asarray(field_value)
+        if arr.shape == ():
+            item = arr.item()
+            if isinstance(item, np.generic):
+                item = item.item()
+            out[field_name] = item
+        else:
+            out[field_name] = arr
+    return out
 
 
 def _load_accelerometer(files: Iterable[str | Path], timezone: str) -> pd.DataFrame:
@@ -355,6 +512,12 @@ def _sliding_kpis(
     m_bb = (freqs >= config.broadband_low_hz) & (
         freqs <= min(config.broadband_high_hz, sample_rate_hz / 2)
     )
+    m_bf = (freqs >= config.low_frequency_band_low_hz) & (
+        freqs <= min(config.low_frequency_band_high_hz, sample_rate_hz / 2)
+    )
+    m_res = (freqs >= config.resonance_band_low_hz) & (
+        freqs <= min(config.resonance_band_high_hz, sample_rate_hz / 2)
+    )
     m_psd = (freqs >= config.psd_min_hz) & (freqs <= min(config.psd_max_hz, sample_rate_hz / 2))
     psd_freqs = freqs[m_psd]
 
@@ -378,15 +541,21 @@ def _sliding_kpis(
             pxx = _window_psd(signal_values, window, nfft, sample_rate_hz, window_power)
             rms_nb = math.sqrt(max(float(np.nansum(pxx[m_nb]) * df), 0.0)) if m_nb.any() else np.nan
             rms_bb = math.sqrt(max(float(np.nansum(pxx[m_bb]) * df), 0.0)) if m_bb.any() else np.nan
+            rms_bf = math.sqrt(max(float(np.nansum(pxx[m_bf]) * df), 0.0)) if m_bf.any() else np.nan
+            rms_res = math.sqrt(max(float(np.nansum(pxx[m_res]) * df), 0.0)) if m_res.any() else np.nan
             f0 = _detect_f0(freqs, pxx, m_s, rpm_k, config.harmonic_bandwidth_hz)
             row[f"f0_{axis_name}_hz"] = f0
             row[f"rms_{axis_name}"] = rms_nb
             row[f"broadband_{axis_name}"] = rms_bb
+            row[f"rms_bf_{axis_name}"] = rms_bf
+            row[f"rms_res_{axis_name}"] = rms_res
             if axis_name == "ax":
                 row["rms_1p_ax"] = _harmonic_rms(freqs, pxx, rpm_k, 1, config.harmonic_bandwidth_hz, df)
                 row["rms_3p_ax"] = _harmonic_rms(freqs, pxx, rpm_k, 3, config.harmonic_bandwidth_hz, df)
                 psd_ax.append(_to_db(pxx[m_psd]))
             else:
+                row["rms_1p_ay"] = _harmonic_rms(freqs, pxx, rpm_k, 1, config.harmonic_bandwidth_hz, df)
+                row["rms_3p_ay"] = _harmonic_rms(freqs, pxx, rpm_k, 3, config.harmonic_bandwidth_hz, df)
                 psd_ay.append(_to_db(pxx[m_psd]))
 
         rows.append(row)
@@ -407,7 +576,12 @@ def _window_psd(
     window_power: float,
 ) -> np.ndarray:
     spectrum = np.fft.rfft(detrend(values) * window, n=nfft)
-    return (2.0 / sample_rate_hz) * np.square(np.abs(spectrum)) / window_power
+    pxx = 2.0 * np.square(np.abs(spectrum)) / (sample_rate_hz * window_power)
+    if pxx.size:
+        pxx[0] *= 0.5
+        if nfft % 2 == 0:
+            pxx[-1] *= 0.5
+    return pxx
 
 
 def _detect_f0(
@@ -458,6 +632,7 @@ def _classify_windows(
     windows: pd.DataFrame,
     sample_rate_hz: int,
     cfg: AnalysisConfig,
+    reference: ReferenceData | None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     turbine = cfg.turbine
     kpis = windows.copy()
@@ -506,11 +681,30 @@ def _classify_windows(
         f0_ref_ax = _safe_median(kpis.loc[f0ax_fbl, "f0_ax_hz"])
     if not np.isfinite(f0_ref_ay):
         f0_ref_ay = _safe_median(kpis.loc[f0ay_fbl, "f0_ay_hz"])
+    internal_f0_ref_ax = f0_ref_ax
+    internal_f0_ref_ay = f0_ref_ay
+
+    reference_source = "internal"
+    reference_path = None
+    if reference is not None:
+        ref_matches = reference.turbine_id in {None, turbine.turbine_id.lower()}
+        has_ref_f0 = np.isfinite(reference.f0_ref_ax_hz) and np.isfinite(reference.f0_ref_ay_hz)
+        if ref_matches and has_ref_f0:
+            f0_ref_ax = reference.f0_ref_ax_hz
+            f0_ref_ay = reference.f0_ref_ay_hz
+            reference_source = "file"
+            reference_path = str(reference.path)
 
     f0_lo_ax, f0_hi_ax = _bounds(f0_ref_ax, cfg.f0_tolerance)
     f0_lo_ay, f0_hi_ay = _bounds(f0_ref_ay, cfg.f0_tolerance)
 
-    bin_id, threshold_frame = _rms_thresholds(kpis, mask_ref, mask_stable, has_wind)
+    bin_id, threshold_frame = _rms_thresholds(
+        kpis,
+        mask_ref,
+        mask_stable,
+        has_wind,
+        reference if reference_source == "file" else None,
+    )
     for column, values in threshold_frame.items():
         kpis[column] = values
     kpis["wind_bin"] = bin_id
@@ -602,6 +796,10 @@ def _classify_windows(
         "stable_count": int(mask_stable.sum()),
         "f0_ref_ax_hz": _rounded(f0_ref_ax, 5),
         "f0_ref_ay_hz": _rounded(f0_ref_ay, 5),
+        "internal_f0_ref_ax_hz": _rounded(internal_f0_ref_ax, 5),
+        "internal_f0_ref_ay_hz": _rounded(internal_f0_ref_ay, 5),
+        "reference_source": reference_source,
+        "reference_path": reference_path,
         "drift_ax_hz_per_day": _rounded(drift_ax, 6),
         "drift_ay_hz_per_day": _rounded(drift_ay, 6),
         "drift_ax_significant": bool(np.isfinite(drift_ax) and abs(drift_ax) > cfg.drift_alert_hz_per_day),
@@ -614,6 +812,275 @@ def _classify_windows(
         "overlap": cfg.overlap,
     }
     return kpis, summary
+
+
+def _fdd_modal_summary(
+    times_utc: pd.DatetimeIndex,
+    ax_filtered: np.ndarray,
+    ay_filtered: np.ndarray,
+    kpis: pd.DataFrame,
+    sample_rate_hz: int,
+    config: AnalysisConfig,
+) -> dict[str, object]:
+    empty = {
+        "fdd_f0_hz": None,
+        "zeta_fdd_pct": None,
+        "fdd_f1_half_power_hz": None,
+        "fdd_f2_half_power_hz": None,
+        "fdd_segments_used": 0,
+    }
+    n = len(ax_filtered)
+    if n < max(8, sample_rate_hz * 60) or kpis.empty:
+        return empty
+
+    win_fdd = min(max(8, int(round(config.fdd_segment_minutes * 60 * sample_rate_hz))), n)
+    nfft_fdd = min(1 << int(math.ceil(math.log2(win_fdd))), 2**17)
+    step_fdd = max(1, int(round(win_fdd * (1 - config.fdd_overlap))))
+    starts = np.arange(0, max(n - win_fdd + 1, 0), step_fdd, dtype=int)
+    if starts.size == 0:
+        starts = np.array([0], dtype=int)
+
+    freqs = np.fft.rfftfreq(nfft_fdd, d=1 / sample_rate_hz)
+    window = np.hamming(win_fdd)
+    n_freq = len(freqs)
+    sxx = np.zeros(n_freq, dtype=float)
+    syy = np.zeros(n_freq, dtype=float)
+    sxy = np.zeros(n_freq, dtype=complex)
+    used = 0
+
+    kpi_times_ns = pd.DatetimeIndex(kpis["time_utc"]).view("int64")
+    is_on = kpis["is_on"].to_numpy(dtype=bool) if "is_on" in kpis else np.ones(len(kpis), dtype=bool)
+
+    for start in starts:
+        idx = slice(start, start + win_fdd)
+        center_ns = times_utc[min(start + win_fdd // 2, n - 1)].value
+        nearest = _nearest_index(kpi_times_ns, center_ns)
+        if nearest is None or not is_on[nearest]:
+            continue
+
+        fx = np.fft.rfft(detrend(ax_filtered[idx]) * window, n=nfft_fdd) / nfft_fdd
+        fy = np.fft.rfft(detrend(ay_filtered[idx]) * window, n=nfft_fdd) / nfft_fdd
+        sxx += np.real(fx * np.conj(fx))
+        syy += np.real(fy * np.conj(fy))
+        sxy += fx * np.conj(fy)
+        used += 1
+
+    if used == 0:
+        return empty
+
+    sxx /= used
+    syy /= used
+    sxy /= used
+    trace = sxx + syy
+    delta = np.sqrt(np.square(sxx - syy) + 4 * np.square(np.abs(sxy)))
+    singular_1 = np.maximum(0.5 * (trace + delta), 0.0)
+
+    modal_mask = (freqs >= config.fdd_low_hz) & (freqs <= min(config.fdd_high_hz, sample_rate_hz / 2))
+    if modal_mask.sum() < 5:
+        return {**empty, "fdd_segments_used": int(used)}
+
+    f_modal = freqs[modal_mask]
+    s1_modal = singular_1[modal_mask]
+    s1_db = 10.0 * np.log10(np.maximum(s1_modal, np.finfo(float).eps))
+    s1_sm_db = _gaussian_smooth(s1_db, 9)
+    s1_sm = np.power(10.0, s1_sm_db / 10.0)
+
+    rpm_median = _robust_rpm_median(kpis, f_modal, s1_sm_db, config)
+    search_mask = (f_modal >= config.f0_low_hz) & (f_modal <= config.f0_high_hz)
+    if np.isfinite(rpm_median):
+        f_1p = rpm_median / 60.0
+        for harmonic in range(1, 9):
+            search_mask &= np.abs(f_modal - harmonic * f_1p) > config.harmonic_bandwidth_hz
+    if search_mask.sum() < 5:
+        search_mask = (f_modal >= config.f0_low_hz) & (f_modal <= config.f0_high_hz)
+    if not search_mask.any():
+        return {**empty, "fdd_segments_used": int(used)}
+
+    search_values = s1_modal.copy()
+    search_values[~search_mask] = 0.0
+    peak_idx = int(np.argmax(search_values))
+    f0_fdd = float(f_modal[peak_idx])
+
+    if 0 < peak_idx < len(f_modal) - 1:
+        local_lo = max(0, peak_idx - 3)
+        local_hi = min(len(f_modal), peak_idx + 4)
+        local_idx = local_lo + int(np.argmax(s1_modal[local_lo:local_hi]))
+        if 0 < local_idx < len(f_modal) - 1:
+            y3 = s1_modal[local_idx - 1 : local_idx + 2]
+            x3 = f_modal[local_idx - 1 : local_idx + 2]
+            dx = x3[1] - x3[0]
+            denom = 2 * (y3[0] - 2 * y3[1] + y3[2])
+            if abs(denom) > np.finfo(float).eps * max(float(np.max(np.abs(y3))), 1.0):
+                candidate = x3[1] - ((y3[2] - y3[0]) / denom) * dx
+                if config.f0_low_hz <= candidate <= config.f0_high_hz and abs(candidate - f0_fdd) < 4 * dx:
+                    f0_fdd = float(candidate)
+
+    smooth_peak_idx = int(np.argmin(np.abs(f_modal - f0_fdd)))
+    peak_value = float(s1_sm[smooth_peak_idx])
+    half_power_level = peak_value * config.half_power_bandwidth_fraction**2
+    left_idx = np.where(s1_sm[:smooth_peak_idx] <= half_power_level)[0]
+    right_idx = np.where(s1_sm[smooth_peak_idx + 1 :] <= half_power_level)[0]
+    f1_hp = float(f_modal[left_idx[-1]]) if left_idx.size else np.nan
+    f2_hp = float(f_modal[smooth_peak_idx + 1 + right_idx[0]]) if right_idx.size else np.nan
+    zeta_pct = np.nan
+    if np.isfinite(f1_hp) and np.isfinite(f2_hp) and f0_fdd > 0:
+        zeta_pct = float((f2_hp - f1_hp) / (2 * f0_fdd) * 100.0)
+
+    return {
+        "fdd_f0_hz": _rounded(f0_fdd, 5),
+        "zeta_fdd_pct": _rounded(zeta_pct, 3),
+        "fdd_f1_half_power_hz": _rounded(f1_hp, 5),
+        "fdd_f2_half_power_hz": _rounded(f2_hp, 5),
+        "fdd_segments_used": int(used),
+    }
+
+
+def _weekly_modal_summary(
+    times_utc: pd.DatetimeIndex,
+    ax_filtered: np.ndarray,
+    ay_filtered: np.ndarray,
+    kpis: pd.DataFrame,
+    sample_rate_hz: int,
+    config: AnalysisConfig,
+) -> pd.DataFrame:
+    columns = [
+        "week_start_utc",
+        "week_end_utc",
+        "window_count",
+        "stable_count",
+        "f0_baseline_ax_hz",
+        "f0_baseline_ay_hz",
+        "f0_drift_ax_hz_per_day",
+        "f0_drift_ay_hz_per_day",
+        "fdd_f0_hz",
+        "zeta_fdd_pct",
+        "fdd_segments_used",
+    ]
+    if kpis.empty:
+        return pd.DataFrame(columns=columns)
+
+    week_start = _week_start_utc(kpis["time_utc"])
+    frame = kpis.assign(week_start_utc=week_start)
+    rows: list[dict[str, object]] = []
+
+    for week, group in frame.groupby("week_start_utc", sort=True):
+        week = pd.Timestamp(week)
+        week_end = week + pd.Timedelta(days=7)
+        sample_mask = (times_utc >= week) & (times_utc < week_end)
+        stable = group["is_stable"].to_numpy(dtype=bool) if "is_stable" in group else np.ones(len(group), dtype=bool)
+        ax_values = group["f0_ax_hz"].to_numpy(dtype=float)
+        ay_values = group["f0_ay_hz"].to_numpy(dtype=float)
+        ax_ok = stable & np.isfinite(ax_values)
+        ay_ok = stable & np.isfinite(ay_values)
+
+        fdd = _fdd_modal_summary(
+            times_utc=times_utc[sample_mask],
+            ax_filtered=ax_filtered[sample_mask],
+            ay_filtered=ay_filtered[sample_mask],
+            kpis=group.reset_index(drop=True),
+            sample_rate_hz=sample_rate_hz,
+            config=config,
+        )
+        rows.append(
+            {
+                "week_start_utc": week,
+                "week_end_utc": min(week_end, pd.Timestamp(group["time_utc"].max()) + pd.Timedelta(minutes=config.window_minutes)),
+                "window_count": int(len(group)),
+                "stable_count": int(stable.sum()),
+                "f0_baseline_ax_hz": _rounded(_safe_median(ax_values[ax_ok]), 5),
+                "f0_baseline_ay_hz": _rounded(_safe_median(ay_values[ay_ok]), 5),
+                "f0_drift_ax_hz_per_day": _rounded(_window_drift(group["time_utc"], ax_values, ax_ok), 6),
+                "f0_drift_ay_hz_per_day": _rounded(_window_drift(group["time_utc"], ay_values, ay_ok), 6),
+                "fdd_f0_hz": fdd["fdd_f0_hz"],
+                "zeta_fdd_pct": fdd["zeta_fdd_pct"],
+                "fdd_segments_used": fdd["fdd_segments_used"],
+            }
+        )
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _nearest_index(sorted_ns: np.ndarray, value_ns: int) -> int | None:
+    if sorted_ns.size == 0:
+        return None
+    pos = int(np.searchsorted(sorted_ns, value_ns))
+    if pos <= 0:
+        return 0
+    if pos >= sorted_ns.size:
+        return sorted_ns.size - 1
+    before = pos - 1
+    return before if value_ns - sorted_ns[before] <= sorted_ns[pos] - value_ns else pos
+
+
+def _robust_rpm_median(
+    kpis: pd.DataFrame,
+    frequencies: np.ndarray,
+    singular_db: np.ndarray,
+    config: AnalysisConfig,
+) -> float:
+    rpm_min, rpm_max = 5.0, 22.0
+    rpm_values = kpis["rpm"].to_numpy(dtype=float) if "rpm" in kpis else np.array([], dtype=float)
+    is_on = kpis["is_on"].to_numpy(dtype=bool) if "is_on" in kpis else np.ones(len(kpis), dtype=bool)
+    is_stable = kpis["is_stable"].to_numpy(dtype=bool) if "is_stable" in kpis else is_on
+    rpm_valid = kpis["rpm_valid"].to_numpy(dtype=bool) if "rpm_valid" in kpis else np.isfinite(rpm_values)
+
+    candidate_masks = (
+        (rpm_valid & is_on, 3),
+        (is_stable & np.isfinite(rpm_values), 3),
+        (is_on & np.isfinite(rpm_values), 1),
+    )
+    for mask, minimum_count in candidate_masks:
+        values = rpm_values[mask]
+        values = values[(values >= rpm_min) & (values <= rpm_max)]
+        if values.size >= minimum_count:
+            return float(np.nanmedian(values))
+
+    f3p_lo = rpm_min * 3 / 60
+    f3p_hi = rpm_max * 3 / 60
+    harmonic_zone = (
+        (frequencies >= f3p_lo)
+        & (frequencies <= f3p_hi)
+        & ((frequencies < config.f0_low_hz) | (frequencies > config.f0_high_hz))
+    )
+    if harmonic_zone.any():
+        zone_values = singular_db[harmonic_zone]
+        peak = float(np.nanmax(zone_values))
+        background = float(np.nanmedian(zone_values))
+        if np.isfinite(peak) and np.isfinite(background) and peak > background + 3:
+            zone_freqs = frequencies[harmonic_zone]
+            return float(zone_freqs[int(np.nanargmax(zone_values))] / 3 * 60)
+    return np.nan
+
+
+def _gaussian_smooth(values: np.ndarray, window_size: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    if arr.size < 3 or window_size <= 1:
+        return arr.copy()
+    window_size = min(window_size, arr.size if arr.size % 2 else arr.size - 1)
+    if window_size < 3:
+        return arr.copy()
+    radius = window_size // 2
+    x = np.arange(-radius, radius + 1, dtype=float)
+    sigma = max(window_size / 6.0, 1e-6)
+    weights = np.exp(-0.5 * np.square(x / sigma))
+    weights /= weights.sum()
+    padded = np.pad(arr, radius, mode="edge")
+    return np.convolve(padded, weights, mode="valid")
+
+
+def _week_start_utc(times: pd.Series) -> pd.Series:
+    series = pd.to_datetime(times, utc=True)
+    normalized = series.dt.normalize()
+    return normalized - pd.to_timedelta(normalized.dt.weekday, unit="D")
+
+
+def _window_drift(times: pd.Series, values: np.ndarray, mask: np.ndarray) -> float:
+    time_series = pd.to_datetime(times, utc=True)
+    t_days = (time_series - time_series.iloc[0]).dt.total_seconds().to_numpy() / 86400.0
+    ok = mask & np.isfinite(values)
+    if ok.sum() <= 20:
+        return np.nan
+    return float(np.polyfit(t_days[ok], values[ok], 1)[0])
 
 
 def _transition_mask(mask_on: np.ndarray, transition_windows: int) -> np.ndarray:
@@ -638,29 +1105,69 @@ def _rms_thresholds(
     mask_ref: np.ndarray,
     mask_stable: np.ndarray,
     has_wind: bool,
+    reference: ReferenceData | None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     n = len(kpis)
-    bins = np.array([3, 5, 7, 9, 11, np.inf], dtype=float)
+    bins = (
+        reference.vbins.astype(float, copy=False)
+        if reference is not None and reference.vbins.size >= 2
+        else np.array([3, 5, 7, 9, 11, np.inf], dtype=float)
+    )
+    nb = len(bins) - 1
     bin_id = np.zeros(n, dtype=int)
     if has_wind:
         wind = kpis["wind_ms"].to_numpy(dtype=float)
-        for idx in range(len(bins) - 1):
+        for idx in range(nb):
             matched = np.isfinite(wind) & (wind >= bins[idx]) & (wind < bins[idx + 1])
             bin_id[matched] = idx + 1
     else:
         bin_id[mask_stable] = 1
 
     thresholds: dict[str, np.ndarray] = {}
+    if reference is not None:
+        ref_columns = {
+            "p95_ax": ("p95_ax", "rep_ax95"),
+            "p99_ax": ("p99_ax", "rep_ax99"),
+            "p95_ay": ("p95_ay", "rep_ay95"),
+            "p99_ay": ("p99_ay", "rep_ay99"),
+            "p95_bb": ("p95_bb", "rep_bb95"),
+            "p99_bb": ("p99_bb", "rep_bb99"),
+            "p95_bf_ax": ("p95_bf_ax", "rep_bf_ax95"),
+            "p99_bf_ax": ("p99_bf_ax", "rep_bf_ax99"),
+            "p95_bf_ay": ("p95_bf_ay", "rep_bf_ay95"),
+            "p99_bf_ay": ("p99_bf_ay", "rep_bf_ay99"),
+            "p95_res_ax": ("p95_res_ax", "rep_res_ax95"),
+            "p99_res_ax": ("p99_res_ax", "rep_res_ax99"),
+            "p95_res_ay": ("p95_res_ay", "rep_res_ay95"),
+            "p99_res_ay": ("p99_res_ay", "rep_res_ay99"),
+        }
+        for output_column, (source_name, fallback_name) in ref_columns.items():
+            source_values = np.asarray(reference.thresholds.get(source_name, []), dtype=float)
+            fallback = float(reference.fallback_thresholds.get(fallback_name, np.nan))
+            out = np.full(n, np.nan)
+            for row, bin_value in enumerate(bin_id):
+                if bin_value <= 0:
+                    continue
+                idx = bin_value - 1
+                value = source_values[idx] if idx < source_values.size else np.nan
+                out[row] = value if np.isfinite(value) else fallback
+            thresholds[output_column] = out
+        return bin_id, thresholds
+
     source_cols = {
         "ax": "rms_ax",
         "ay": "rms_ay",
         "bb": "broadband_ax",
+        "bf_ax": "rms_bf_ax",
+        "bf_ay": "rms_bf_ay",
+        "res_ax": "rms_res_ax",
+        "res_ay": "rms_res_ay",
     }
     for suffix, source in source_cols.items():
-        p95 = np.full(len(bins) - 1, np.nan)
-        p99 = np.full(len(bins) - 1, np.nan)
+        p95 = np.full(nb, np.nan)
+        p99 = np.full(nb, np.nan)
         values = kpis[source].to_numpy(dtype=float)
-        for idx in range(len(bins) - 1):
+        for idx in range(nb):
             matched = mask_ref & (bin_id == idx + 1)
             if matched.sum() >= 5:
                 p95[idx] = np.nanpercentile(values[matched], 95)
@@ -782,6 +1289,8 @@ def _to_db(values: np.ndarray) -> np.ndarray:
 
 
 def _rounded(value: float, digits: int) -> float | None:
+    if value is None:
+        return None
     if not np.isfinite(value):
         return None
     return round(float(value), digits)
