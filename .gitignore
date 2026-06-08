@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.venv/
 
 .DS_Store
 ._*
@@ -12,3 +13,5 @@ WT5/
 WT7/
 
 *.zip
+
+/dataset/
