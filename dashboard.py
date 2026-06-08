@@ -10,15 +10,20 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from wind_dashboard import AnalysisConfig, TURBINES, analyze_dataset
+from wind_dashboard import (
+    AnalysisConfig,
+    accelerometer_dir_for_turbine,
+    analyze_dataset,
+    discover_turbine_ids,
+    scada_dir_for_dataset,
+)
 from wind_dashboard.analysis import discover_accelerometer_files, discover_scada_files
 from wind_dashboard.reports import build_weekly_text_report
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_ACCEL_DIR = BASE_DIR / "Echantillon 1Hz" / "data5"
-DEFAULT_SCADA_DIR = BASE_DIR / "Echantillon 1Hz" / "SCADA"
-ANALYSIS_CACHE_VERSION = 4
+DEFAULT_DATASET_DIR = BASE_DIR / "dataset"
+ANALYSIS_CACHE_VERSION = 9
 
 
 st.set_page_config(
@@ -222,8 +227,8 @@ def render_summary(result, filtered: pd.DataFrame) -> None:
         ("f0 AX baseline", _fmt(summary.get("f0_ref_ax_hz"), " Hz", 4)),
         ("f0 AY baseline", _fmt(summary.get("f0_ref_ay_hz"), " Hz", 4)),
         ("Weekly zeta", _fmt(None if latest_week is None else latest_week.get("zeta_fdd_pct"), "%", 2)),
-        ("AX drift", _fmt(summary.get("drift_ax_hz_per_day"), " Hz/day", 5)),
-        ("AY drift", _fmt(summary.get("drift_ay_hz_per_day"), " Hz/day", 5)),
+        ("Weekly AX shift", _fmt(None if latest_week is None else latest_week.get("f0_shift_ax_hz"), " Hz/week", 5)),
+        ("Weekly AY shift", _fmt(None if latest_week is None else latest_week.get("f0_shift_ay_hz"), " Hz/week", 5)),
     ]
     cards = "".join(
         f'<div class="summary-card"><div class="summary-label">{escape(str(label))}</div>'
@@ -276,9 +281,10 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object]) -> Non
         ),
     )
 
-    stable = df[df["is_stable"]].copy()
-    fig.add_trace(_markers(stable, "f0_ax_hz", "f0 AX", "#2563eb", size=5), row=1, col=1)
-    fig.add_trace(_markers(stable, "f0_ay_hz", "f0 AY", "#15803d", size=5), row=1, col=1)
+    valid_ax = df[df["f0_ax_hz"].notna()].copy()
+    valid_ay = df[df["f0_ay_hz"].notna()].copy()
+    fig.add_trace(_markers(valid_ax, "f0 AX", "#93c5fd", "f0_ax_hz", size=4, opacity=0.38), row=1, col=1)
+    fig.add_trace(_markers(valid_ay, "f0 AY", "#86efac", "f0_ay_hz", size=4, opacity=0.38), row=1, col=1)
     fig.add_trace(_line(df, "f0_ax_trend_hz", "AX trend", "#1d4ed8"), row=1, col=1)
     fig.add_trace(_line(df, "f0_ay_trend_hz", "AY trend", "#166534"), row=1, col=1)
 
@@ -348,8 +354,6 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object]) -> Non
             col=1,
             secondary_y=True,
         )
-
-    _add_stopped_regions(fig, df, theme)
 
     fig.update_yaxes(title_text="Hz", row=1, col=1)
     fig.update_yaxes(title_text="Hz", row=2, col=1, secondary_y=False)
@@ -618,19 +622,27 @@ def _modal_num(value: object, digits: int) -> str:
     return f"{value_f:.{digits}f}"
 
 
-def _markers(df: pd.DataFrame, column: str, name: str, color: str, size: int) -> go.Scatter:
-    return go.Scatter(
+def _markers(
+    df: pd.DataFrame,
+    name: str,
+    color: str,
+    column: str,
+    *,
+    size: int,
+    opacity: float = 0.9,
+) -> go.Scattergl:
+    return go.Scattergl(
         x=df["time_utc"],
         y=df[column],
         mode="markers",
         name=name,
-        marker={"color": color, "size": size, "opacity": 0.75},
+        marker={"color": color, "size": size, "opacity": opacity},
     )
 
 
-def _line(df: pd.DataFrame, column: str, name: str, color: str, dash: str = "solid") -> go.Scatter:
+def _line(df: pd.DataFrame, column: str, name: str, color: str, dash: str = "solid") -> go.Scattergl:
     visible = "legendonly" if name in {"AX P95", "AX P99.5", "AY P95", "AY P99.5"} else True
-    return go.Scatter(
+    return go.Scattergl(
         x=df["time_utc"],
         y=df[column],
         mode="lines",
@@ -725,16 +737,23 @@ def main() -> None:
 
     st.title("Wind Turbine Surveillance")
 
-    accel_dir = st.sidebar.text_input("Accelerometer folder", str(DEFAULT_ACCEL_DIR))
-    turbine_id = st.sidebar.selectbox("Turbine", list(TURBINES), index=list(TURBINES).index("w005"))
-    scada_dir = st.sidebar.text_input("SCADA folder", str(DEFAULT_SCADA_DIR))
+    dataset_dir = st.sidebar.text_input("Dataset folder", str(DEFAULT_DATASET_DIR))
+    turbine_ids = discover_turbine_ids(dataset_dir)
+    if not turbine_ids:
+        st.error(f"No turbine folders found in {dataset_dir}. Expected folders such as data5 or data7.")
+        return
+    turbine_id = st.sidebar.selectbox("Turbine", turbine_ids, format_func=str.upper)
+    accel_dir = accelerometer_dir_for_turbine(dataset_dir, turbine_id)
+    scada_dir = scada_dir_for_dataset(dataset_dir)
+    st.sidebar.caption(f"Accelerometer: {accel_dir}")
+    st.sidebar.caption(f"SCADA: {scada_dir}")
     window_minutes = st.sidebar.selectbox("Window length", [5, 10, 20, 30], index=1)
     overlap = st.sidebar.slider("Window overlap", min_value=0.0, max_value=0.8, value=0.5, step=0.1)
 
     try:
         result = load_weekly_result(
-            accel_dir,
-            scada_dir,
+            str(accel_dir),
+            str(scada_dir),
             turbine_id,
             window_minutes,
             overlap,

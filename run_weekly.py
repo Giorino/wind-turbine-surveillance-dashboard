@@ -6,26 +6,38 @@ from pathlib import Path
 
 import numpy as np
 
-from wind_dashboard import AnalysisConfig, analyze_dataset
+from wind_dashboard import (
+    AnalysisConfig,
+    accelerometer_dir_for_turbine,
+    analyze_dataset,
+    discover_turbine_ids,
+    scada_dir_for_dataset,
+)
 from wind_dashboard.analysis import discover_accelerometer_files, discover_scada_files
 from wind_dashboard.reports import build_all_weekly_text_reports
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_DATASET_DIR = BASE_DIR / "dataset"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one weekly wind turbine surveillance analysis.")
-    parser.add_argument("--turbine", default="w005", help="Turbine id such as w003, w005, or w007.")
+    parser.add_argument("--turbine", default=None, help="Optional turbine id. Defaults to the first dataset/data* folder.")
+    parser.add_argument(
+        "--dataset-dir",
+        default=str(DEFAULT_DATASET_DIR),
+        help="Root dataset folder. Expected structure: data<id> turbine folders plus SCADA.",
+    )
     parser.add_argument(
         "--accel-dir",
-        default=str(BASE_DIR / "Echantillon 1Hz" / "data5"),
-        help="Folder containing accelerometer CSV or CSV ZIP files.",
+        default=None,
+        help="Optional override for the accelerometer folder.",
     )
     parser.add_argument(
         "--scada-dir",
-        default=str(BASE_DIR / "Echantillon 1Hz" / "SCADA"),
-        help="Folder containing SCADA CSV files.",
+        default=None,
+        help="Optional override for the SCADA folder.",
     )
     parser.add_argument("--window-minutes", type=int, default=10)
     parser.add_argument("--overlap", type=float, default=0.5)
@@ -48,10 +60,20 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    accel_files = discover_accelerometer_files(args.accel_dir)
-    scada_files = discover_scada_files(args.scada_dir)
+    turbine_id = args.turbine
+    if turbine_id is None:
+        discovered = discover_turbine_ids(args.dataset_dir)
+        if not discovered:
+            raise SystemExit(f"No turbine folders found in {args.dataset_dir}. Expected folders such as data5 or data7.")
+        turbine_id = discovered[0]
+
+    accel_dir = Path(args.accel_dir) if args.accel_dir else accelerometer_dir_for_turbine(args.dataset_dir, turbine_id)
+    scada_dir = Path(args.scada_dir) if args.scada_dir else scada_dir_for_dataset(args.dataset_dir)
+
+    accel_files = discover_accelerometer_files(accel_dir)
+    scada_files = discover_scada_files(scada_dir)
     config = AnalysisConfig(
-        turbine_id=args.turbine,
+        turbine_id=turbine_id,
         window_minutes=args.window_minutes,
         overlap=args.overlap,
         reference_dir=args.reference_dir,

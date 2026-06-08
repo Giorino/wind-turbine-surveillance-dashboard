@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import re
+import csv
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +13,70 @@ import pandas as pd
 from scipy.io import loadmat
 from scipy.signal import butter, detrend, filtfilt
 
-from .config import TURBINES, TurbineConfig
+from .config import TurbineConfig, get_turbine_config
+
+
+DATE_CSV_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.csv$", re.IGNORECASE)
+DATE_CSV_ZIP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.csv\.zip$", re.IGNORECASE)
+SCADA_COLUMNS_18 = [
+    "w001Speed",
+    "w001Power",
+    "w002Speed",
+    "w002Power",
+    "w003Speed",
+    "w003Power",
+    "w003DirectionNacelle",
+    "w003Direction",
+    "w004Speed",
+    "w004Power",
+    "w005Speed",
+    "w005Power",
+    "w006Speed",
+    "w006Power",
+    "w007Speed",
+    "w007Power",
+    "pointTime",
+    "",
+]
+SCADA_COLUMNS_37 = [
+    "w001Speed",
+    "w001Power",
+    "w001RotorSpeed",
+    "w001DirectionNacelle",
+    "w001Direction",
+    "w002Speed",
+    "w002Power",
+    "w002RotorSpeed",
+    "w002DirectionNacelle",
+    "w002Direction",
+    "w003Speed",
+    "w003Power",
+    "w003RotorSpeed",
+    "w003DirectionNacelle",
+    "w003Direction",
+    "w004Speed",
+    "w004Power",
+    "w004RotorSpeed",
+    "w004DirectionNacelle",
+    "w004Direction",
+    "w005Speed",
+    "w005Power",
+    "w005RotorSpeed",
+    "w005DirectionNacelle",
+    "w005Direction",
+    "w006Speed",
+    "w006Power",
+    "w006RotorSpeed",
+    "w006DirectionNacelle",
+    "w006Direction",
+    "w007Speed",
+    "w007Power",
+    "w007RotorSpeed",
+    "w007DirectionNacelle",
+    "w007Direction",
+    "pointTime",
+    "",
+]
 
 
 @dataclass(frozen=True)
@@ -52,10 +117,7 @@ class AnalysisConfig:
 
     @property
     def turbine(self) -> TurbineConfig:
-        key = self.turbine_id.lower()
-        if key not in TURBINES:
-            raise ValueError(f"Unknown turbine '{self.turbine_id}'. Expected one of {', '.join(TURBINES)}.")
-        return TURBINES[key]
+        return get_turbine_config(self.turbine_id)
 
 
 @dataclass
@@ -185,12 +247,12 @@ def discover_accelerometer_files(path: str | Path) -> list[Path]:
         return [root]
     if not root.exists():
         return []
-    files = [
-        *root.glob("*.csv"),
-        *root.glob("*.csv.zip"),
-        *root.glob("*.zip"),
-    ]
-    return sorted(p for p in files if not p.name.startswith("._"))
+    files = [*root.glob("*.csv"), *root.glob("*.csv.zip")]
+    return sorted(
+        p
+        for p in files
+        if not p.name.startswith("._") and (DATE_CSV_RE.fullmatch(p.name) or DATE_CSV_ZIP_RE.fullmatch(p.name))
+    )
 
 
 def discover_scada_files(path: str | Path) -> list[Path]:
@@ -199,7 +261,7 @@ def discover_scada_files(path: str | Path) -> list[Path]:
         return [root]
     if not root.exists():
         return []
-    return sorted(p for p in root.glob("*.csv") if not p.name.startswith("._"))
+    return sorted(p for p in root.glob("*.csv") if not p.name.startswith("._") and DATE_CSV_RE.fullmatch(p.name))
 
 
 def _load_reference_for_turbine(cfg: AnalysisConfig) -> ReferenceData | None:
@@ -330,7 +392,7 @@ def _load_scada(files: Iterable[str | Path], timezone: str) -> pd.DataFrame:
         path = Path(file)
         if not path.exists() or path.name.startswith("._"):
             continue
-        frame = pd.read_csv(path)
+        frame = _read_scada_csv(path)
         frame = frame.loc[:, ~frame.columns.str.match(r"^Unnamed")]
         time_col = _find_time_column(frame)
         if not time_col:
@@ -358,6 +420,40 @@ def _read_csv_or_zip(path: Path) -> pd.DataFrame:
             raise ValueError(f"{path} does not contain a CSV file.")
         with archive.open(csv_names[0]) as csv_file:
             return pd.read_csv(csv_file)
+
+
+def _read_scada_csv(path: Path) -> pd.DataFrame:
+    segments: dict[tuple[str, ...], list[list[str]]] = {}
+    current_header: list[str] | None = None
+
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        for line_number, row in enumerate(reader, start=1):
+            if not row or all(not cell.strip() for cell in row):
+                continue
+            if "pointTime" in row:
+                current_header = _normalize_csv_header(row)
+                continue
+
+            header = current_header if current_header and len(current_header) == len(row) else _scada_header_for_width(len(row))
+            if header is None:
+                raise ValueError(f"{path} has an unsupported SCADA row width at line {line_number}: {len(row)} fields.")
+            segments.setdefault(tuple(header), []).append(row)
+
+    frames = [pd.DataFrame(rows, columns=list(header)) for header, rows in segments.items()]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _normalize_csv_header(row: list[str]) -> list[str]:
+    return [column.strip() if column.strip() else f"Unnamed: {index}" for index, column in enumerate(row)]
+
+
+def _scada_header_for_width(width: int) -> list[str] | None:
+    if width == len(SCADA_COLUMNS_18):
+        return _normalize_csv_header(SCADA_COLUMNS_18)
+    if width == len(SCADA_COLUMNS_37):
+        return _normalize_csv_header(SCADA_COLUMNS_37)
+    return None
 
 
 def _parse_time(values: pd.Series, timezone: str) -> pd.Series:
@@ -648,13 +744,21 @@ def _classify_windows(
     has_wind = kpis["wind_ms"].notna().any()
     has_rpm = kpis["rpm"].notna().any()
 
+    rms_floor = np.nanpercentile(np.r_[kpis["rms_ax"], kpis["rms_ay"]], 20)
+    vibration_on = ((kpis["rms_ax"] > rms_floor) | (kpis["rms_ay"] > rms_floor)).to_numpy()
+
     if has_power and (kpis["power_kw"] > cfg.power_on_threshold_kw).any():
-        mask_on = (kpis["power_kw"] > cfg.power_on_threshold_kw).to_numpy()
+        power_values = kpis["power_kw"]
+        mask_on = (power_values > cfg.power_on_threshold_kw).to_numpy().copy()
+        missing_power = power_values.isna().to_numpy()
+        mask_on[missing_power] = vibration_on[missing_power]
     elif has_wind:
-        mask_on = (kpis["wind_ms"] > turbine.cutin_ms).to_numpy()
+        wind_values = kpis["wind_ms"]
+        mask_on = (wind_values > turbine.cutin_ms).to_numpy().copy()
+        missing_wind = wind_values.isna().to_numpy()
+        mask_on[missing_wind] = vibration_on[missing_wind]
     else:
-        floor = np.nanpercentile(np.r_[kpis["rms_ax"], kpis["rms_ay"]], 20)
-        mask_on = ((kpis["rms_ax"] > floor) | (kpis["rms_ay"] > floor)).to_numpy()
+        mask_on = vibration_on
 
     mask_transition = _transition_mask(mask_on, cfg.transition_windows)
     mask_stable = mask_on & ~mask_transition
@@ -854,12 +958,12 @@ def _fdd_modal_summary(
     sxy = np.zeros(n_freq, dtype=complex)
     used = 0
 
-    kpi_times_ns = pd.DatetimeIndex(kpis["time_utc"]).view("int64")
+    kpi_times_ns = _datetime_ns(kpis["time_utc"])
     is_on = kpis["is_on"].to_numpy(dtype=bool) if "is_on" in kpis else np.ones(len(kpis), dtype=bool)
 
     for start in starts:
         idx = slice(start, start + win_fdd)
-        center_ns = times_utc[min(start + win_fdd // 2, n - 1)].value
+        center_ns = int(pd.Timestamp(times_utc[min(start + win_fdd // 2, n - 1)]).value)
         nearest = _nearest_index(kpi_times_ns, center_ns)
         if nearest is None or not is_on[nearest]:
             continue
@@ -1100,6 +1204,8 @@ def _weekly_modal_summary(
         "stable_count",
         "f0_baseline_ax_hz",
         "f0_baseline_ay_hz",
+        "f0_shift_ax_hz",
+        "f0_shift_ay_hz",
         "f0_drift_ax_hz_per_day",
         "f0_drift_ay_hz_per_day",
         "fdd_f0_hz",
@@ -1147,7 +1253,18 @@ def _weekly_modal_summary(
             }
         )
 
-    return pd.DataFrame(rows, columns=columns)
+    weekly = pd.DataFrame(rows)
+    if weekly.empty:
+        return pd.DataFrame(columns=columns)
+    weekly["f0_shift_ax_hz"] = weekly["f0_baseline_ax_hz"].astype(float).diff()
+    weekly["f0_shift_ay_hz"] = weekly["f0_baseline_ay_hz"].astype(float).diff()
+    weekly["f0_shift_ax_hz"] = weekly["f0_shift_ax_hz"].map(lambda value: _rounded(value, 6))
+    weekly["f0_shift_ay_hz"] = weekly["f0_shift_ay_hz"].map(lambda value: _rounded(value, 6))
+    return weekly.reindex(columns=columns)
+
+
+def _datetime_ns(values: object) -> np.ndarray:
+    return pd.to_datetime(values, utc=True).to_numpy(dtype="datetime64[ns]").astype(np.int64)
 
 
 def _nearest_index(sorted_ns: np.ndarray, value_ns: int) -> int | None:
