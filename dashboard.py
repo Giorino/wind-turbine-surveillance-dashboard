@@ -12,12 +12,13 @@ from plotly.subplots import make_subplots
 
 from wind_dashboard import AnalysisConfig, TURBINES, analyze_dataset
 from wind_dashboard.analysis import discover_accelerometer_files, discover_scada_files
+from wind_dashboard.reports import build_weekly_text_report
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_ACCEL_DIR = BASE_DIR / "Echantillon 1Hz" / "data5"
 DEFAULT_SCADA_DIR = BASE_DIR / "Echantillon 1Hz" / "SCADA"
-DEFAULT_REFERENCE_DIR = BASE_DIR / "reference-matlab-files"
+ANALYSIS_CACHE_VERSION = 4
 
 
 st.set_page_config(
@@ -27,40 +28,25 @@ st.set_page_config(
 )
 
 
-THEMES = {
-    "Light": {
-        "app_bg": "#f8fafc",
-        "sidebar_bg": "#eef2f7",
-        "panel_bg": "#ffffff",
-        "plot_bg": "#ffffff",
-        "border": "#d8dee8",
-        "text": "#0f172a",
-        "muted": "#475569",
-        "grid": "#e2e8f0",
-        "input_bg": "#ffffff",
-        "stopped": "#334155",
-        "stopped_opacity": 0.18,
-        "plotly_template": "plotly_white",
-    },
-    "Dark": {
-        "app_bg": "#0f1117",
-        "sidebar_bg": "#272832",
-        "panel_bg": "#171b24",
-        "plot_bg": "#0f1117",
-        "border": "#2f3746",
-        "text": "#f8fafc",
-        "muted": "#cbd5e1",
-        "grid": "#2f3746",
-        "input_bg": "#111827",
-        "stopped": "#94a3b8",
-        "stopped_opacity": 0.20,
-        "plotly_template": "plotly_dark",
-    },
+THEME = {
+    "app_bg": "#f8fafc",
+    "sidebar_bg": "#eef2f7",
+    "panel_bg": "#ffffff",
+    "plot_bg": "#ffffff",
+    "border": "#d8dee8",
+    "text": "#0f172a",
+    "muted": "#475569",
+    "grid": "#e2e8f0",
+    "input_bg": "#ffffff",
+    "code_bg": "#f1f5f9",
+    "stopped": "#334155",
+    "stopped_opacity": 0.18,
+    "plotly_template": "plotly_white",
 }
 
 
-def apply_theme(theme_name: str) -> dict[str, object]:
-    theme = THEMES[theme_name]
+def apply_theme() -> dict[str, object]:
+    theme = THEME
     st.markdown(
         f"""
         <style>
@@ -97,6 +83,47 @@ def apply_theme(theme_name: str) -> dict[str, object]:
             background: {theme["input_bg"]} !important;
             color: {theme["text"]} !important;
             border-color: {theme["border"]} !important;
+        }}
+        [data-testid="stButton"] button,
+        [data-testid="stDownloadButton"] button {{
+            background: {theme["panel_bg"]} !important;
+            color: {theme["text"]} !important;
+            border: 1px solid {theme["border"]} !important;
+            border-radius: 6px !important;
+        }}
+        [data-testid="stButton"] button *,
+        [data-testid="stDownloadButton"] button * {{
+            color: {theme["text"]} !important;
+        }}
+        [data-testid="stButton"] button:hover,
+        [data-testid="stDownloadButton"] button:hover {{
+            background: {theme["input_bg"]} !important;
+            border-color: {theme["muted"]} !important;
+        }}
+        [data-testid="stExpander"] details {{
+            background: {theme["panel_bg"]} !important;
+            border: 1px solid {theme["border"]} !important;
+            border-radius: 6px !important;
+        }}
+        [data-testid="stExpander"] summary,
+        [data-testid="stExpander"] summary *,
+        [data-testid="stExpander"] [data-testid="stMarkdownContainer"],
+        [data-testid="stExpander"] [data-testid="stMarkdownContainer"] p {{
+            color: {theme["text"]} !important;
+        }}
+        [data-testid="stCode"],
+        [data-testid="stCode"] pre {{
+            background: {theme["code_bg"]} !important;
+            color: {theme["text"]} !important;
+        }}
+        [data-testid="stCode"] code,
+        [data-testid="stCode"] span {{
+            background: transparent !important;
+            color: {theme["text"]} !important;
+        }}
+        [data-testid="stCode"] {{
+            border: 1px solid {theme["border"]} !important;
+            border-radius: 6px !important;
         }}
         .summary-grid {{
             display: grid;
@@ -140,9 +167,9 @@ def load_weekly_result(
     turbine_id: str,
     window_minutes: int,
     overlap: float,
-    reference_dir: str,
-    use_reference_files: bool,
+    analysis_cache_version: int,
 ):
+    _ = analysis_cache_version
     accel_files = discover_accelerometer_files(accel_dir)
     scada_files = discover_scada_files(scada_dir)
     if not accel_files:
@@ -152,8 +179,8 @@ def load_weekly_result(
         turbine_id=turbine_id,
         window_minutes=window_minutes,
         overlap=overlap,
-        reference_dir=reference_dir,
-        use_reference_files=use_reference_files,
+        reference_dir=None,
+        use_reference_files=False,
     )
     return analyze_dataset(accel_files, scada_files, config)
 
@@ -192,9 +219,6 @@ def render_summary(result, filtered: pd.DataFrame) -> None:
     items = [
         ("Turbine", summary["turbine_id"]),
         ("Sample rate", f"{summary['sample_rate_hz']} Hz"),
-        ("Windows", f"{len(filtered):,}"),
-        ("Stable", f"{int(filtered['is_stable'].sum()):,}"),
-        ("Baseline source", _baseline_source_label(summary.get("reference_source", "internal"))),
         ("f0 AX baseline", _fmt(summary.get("f0_ref_ax_hz"), " Hz", 4)),
         ("f0 AY baseline", _fmt(summary.get("f0_ref_ay_hz"), " Hz", 4)),
         ("Weekly zeta", _fmt(None if latest_week is None else latest_week.get("zeta_fdd_pct"), "%", 2)),
@@ -207,6 +231,35 @@ def render_summary(result, filtered: pd.DataFrame) -> None:
         for label, value in items
     )
     st.markdown(f'<div class="summary-grid">{cards}</div>', unsafe_allow_html=True)
+
+
+def render_weekly_report_download(result) -> None:
+    if result.weekly.empty:
+        return
+
+    st.subheader("Weekly Report")
+    options = [
+        (
+            index,
+            f"{pd.Timestamp(row['week_start_utc']).strftime('%Y-%m-%d')} to "
+            f"{pd.Timestamp(row['week_end_utc']).strftime('%Y-%m-%d')}",
+        )
+        for index, row in result.weekly.iterrows()
+    ]
+    selected_index = st.selectbox(
+        "Report period",
+        [index for index, _ in options],
+        format_func=lambda index: dict(options)[index],
+    )
+    report = build_weekly_text_report(result, int(selected_index))
+    st.download_button(
+        f"Download {report.filename}",
+        data=report.content.encode("utf-8"),
+        file_name=report.filename,
+        mime="text/plain",
+    )
+    with st.expander("Preview report"):
+        st.code(report.content, language="text")
 
 
 def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object]) -> None:
@@ -361,6 +414,210 @@ def render_psd(result, df: pd.DataFrame, theme: dict[str, object]) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
+def render_modal_diagram(result, theme: dict[str, object]) -> None:
+    modal = getattr(result, "modal", {})
+    if not modal or not modal.get("available"):
+        st.info(str(modal.get("reason", "Modal diagram is not available for this dataset.")))
+        return
+
+    freqs = np.asarray(modal["frequencies_hz"], dtype=float)
+    threshold = float(modal["threshold_db"])
+    fdd_f0 = modal.get("fdd_f0_hz")
+    fdd_zeta = modal.get("fdd_zeta_pct")
+    # title = (
+    #     f"[{result.summary['turbine_id']}] Modal Diagram | "
+    #     f"AX P90: {_modal_num(modal['ax'].get('f0_hz'), 4)}Hz | "
+    #     f"AY P90: {_modal_num(modal['ay'].get('f0_hz'), 4)}Hz | "
+    #     f"FDD: f0={_modal_num(fdd_f0, 4)}Hz zeta={_modal_num(fdd_zeta, 2)}%"
+    # )
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.16,
+        subplot_titles=(
+            _modal_subplot_title(result, modal, "ax", "AX (fore-aft)"),
+            _modal_subplot_title(result, modal, "ay", "AY (lateral)"),
+        ),
+    )
+
+    _add_modal_axis(fig, modal, freqs, threshold, "ax", 1, "#2563eb", show_legend=True)
+    _add_modal_axis(fig, modal, freqs, threshold, "ay", 2, "#16a34a", show_legend=False)
+
+    match_ax = "YES" if modal.get("fdd_match_ax") else "NO"
+    match_ay = "YES" if modal.get("fdd_match_ay") else "NO"
+    fig.add_annotation(
+        x=0.99,
+        y=-0.10,
+        xref="paper",
+        yref="paper",
+        text=f"Match ref: AX={match_ax} | AY={match_ay}",
+        showarrow=False,
+        align="right",
+        bgcolor=str(theme["panel_bg"]),
+        bordercolor=str(theme["border"]),
+        borderwidth=1,
+        font={"color": str(theme["text"]), "size": 12},
+    )
+    _style_plot(
+        fig,
+        theme,
+        height=900,
+        margin={"l": 42, "r": 76, "t": 76, "b": 82},
+        legend={"orientation": "h", "y": 1.06, "x": 0.01, "groupclick": "togglegroup"},
+    )
+    #fig.update_layout(title={"text": title, "x": 0.5, "xanchor": "center"})
+    fig.update_xaxes(title_text="Frequency (Hz)", range=[0.10, min(0.80, result.sample_rate_hz / 2)])
+    fig.update_yaxes(title_text="Amplitude (dB)", range=[-160, -40])
+    st.plotly_chart(fig, width="stretch")
+
+
+def _add_modal_axis(
+    fig: go.Figure,
+    modal: dict[str, object],
+    freqs: np.ndarray,
+    threshold: float,
+    axis: str,
+    row: int,
+    axis_color: str,
+    *,
+    show_legend: bool,
+) -> None:
+    amplitudes = np.asarray(modal[f"{axis}_db"], dtype=float)
+    env_freqs = np.asarray(modal["env_frequencies_hz"], dtype=float)
+    env = modal[f"{axis}_envelope"]
+    p10 = np.asarray(env["p10"], dtype=float)
+    scatter_x = np.tile(freqs, amplitudes.shape[0])
+    scatter_y = amplitudes.reshape(-1)
+
+    valid_floor = np.isfinite(env_freqs) & np.isfinite(p10)
+    if valid_floor.sum() >= 2:
+        floor_by_freq = np.interp(freqs, env_freqs[valid_floor], p10[valid_floor])
+        scatter_floor = np.tile(floor_by_freq, amplitudes.shape[0])
+        # A global MATLAB-style percentile cutoff becomes a flat floor on 1 Hz data.
+        shown = np.isfinite(scatter_y) & (scatter_y >= scatter_floor)
+    else:
+        shown = np.isfinite(scatter_y) & (scatter_y > threshold)
+
+    if shown.any():
+        vmin = float(np.nanpercentile(scatter_y[shown], 1))
+        vmax = float(np.nanmax(scatter_y[shown]))
+        fig.add_trace(
+            go.Scattergl(
+                x=scatter_x[shown],
+                y=scatter_y[shown],
+                mode="markers",
+                name="FFT scatter",
+                showlegend=show_legend,
+                legendgroup="modal-fft-scatter",
+                marker={
+                    "color": scatter_y[shown],
+                    "colorscale": "Jet",
+                    "cmin": vmin,
+                    "cmax": vmax,
+                    "size": 3,
+                    "opacity": 0.55,
+                    "colorbar": {
+                        "title": {"text": "dB"},
+                        "len": 0.38,
+                        "y": 0.78 if row == 1 else 0.22,
+                    },
+                },
+                hovertemplate="Frequency=%{x:.4f} Hz<br>Amplitude=%{y:.1f} dB<extra></extra>",
+            ),
+            row=row,
+            col=1,
+        )
+
+    for name, values, color, dash, width, legend_group in (
+        ("P10 (floor)", env["p10"], "#e5e7eb", "solid", 1.1, "modal-p10"),
+        ("P50 (median)", env["p50"], "#facc15", "solid", 1.2, "modal-p50"),
+        ("P90 smooth (estimator)", env["p90_smooth"], "#111827", "dash", 1.6, "modal-p90"),
+    ):
+        fig.add_trace(
+            go.Scattergl(
+                x=env_freqs,
+                y=np.asarray(values, dtype=float),
+                mode="lines",
+                name=name,
+                showlegend=show_legend,
+                legendgroup=legend_group,
+                line={"color": color, "dash": dash, "width": width},
+                hovertemplate="Frequency=%{x:.4f} Hz<br>Amplitude=%{y:.1f} dB<extra></extra>",
+            ),
+            row=row,
+            col=1,
+        )
+
+    params = modal[axis]
+    for value, color, dash, width in (
+        (params.get("f0_hz"), axis_color, "solid", 2.0),
+        (params.get("f1_hz"), axis_color, "dot", 1.2),
+        (params.get("f2_hz"), axis_color, "dot", 1.2),
+        (modal.get("fdd_f0_hz"), "#ef4444", "dash", 1.6),
+    ):
+        if value is not None and np.isfinite(float(value)):
+            fig.add_trace(
+                go.Scatter(
+                    x=[float(value), float(value)],
+                    y=[-160, -40],
+                    mode="lines",
+                    showlegend=False,
+                    line={"color": color, "dash": dash, "width": width},
+                    hoverinfo="skip",
+                ),
+                row=row,
+                col=1,
+            )
+
+    label_x = float(np.nanmin(freqs) + 0.03 * (np.nanmax(freqs) - np.nanmin(freqs)))
+    if params.get("f0_hz") is not None:
+        fig.add_annotation(
+            x=label_x,
+            y=-128,
+            text=f"P90: f0={_modal_num(params.get('f0_hz'), 4)}Hz  zeta={_modal_num(params.get('zeta_pct'), 2)}%",
+            showarrow=False,
+            bgcolor="#ffffff",
+            bordercolor=axis_color,
+            borderwidth=1,
+            font={"color": axis_color, "size": 12},
+            row=row,
+            col=1,
+        )
+    if modal.get("fdd_f0_hz") is not None:
+        fig.add_annotation(
+            x=label_x,
+            y=-139,
+            text=f"FDD: f0={_modal_num(modal.get('fdd_f0_hz'), 4)}Hz  zeta={_modal_num(modal.get('fdd_zeta_pct'), 2)}%",
+            showarrow=False,
+            bgcolor="#ffffff",
+            bordercolor="#ef4444",
+            borderwidth=1,
+            font={"color": "#ef4444", "size": 12},
+            row=row,
+            col=1,
+        )
+
+
+def _modal_subplot_title(result, modal: dict[str, object], axis: str, label: str) -> str:
+    params = modal[axis]
+    return (
+        f"[{result.summary['turbine_id']}] Modal Diagram {label} | "
+        f"{modal['window_count']} windows | "
+        f"P90: f0={_modal_num(params.get('f0_hz'), 4)}Hz | "
+        f"FDD: zeta={_modal_num(modal.get('fdd_zeta_pct'), 2)}%"
+    )
+
+
+def _modal_num(value: object, digits: int) -> str:
+    if value is None:
+        return "n/a"
+    value_f = float(value)
+    if not np.isfinite(value_f):
+        return "n/a"
+    return f"{value_f:.{digits}f}"
+
+
 def _markers(df: pd.DataFrame, column: str, name: str, color: str, size: int) -> go.Scatter:
     return go.Scatter(
         x=df["time_utc"],
@@ -464,16 +721,13 @@ def _fmt(value, suffix: str, digits: int) -> str:
 
 def main() -> None:
     st.sidebar.header("Dataset")
-    theme_name = st.sidebar.radio("Theme", list(THEMES), horizontal=True)
-    theme = apply_theme(theme_name)
+    theme = apply_theme()
 
     st.title("Wind Turbine Surveillance")
 
-    turbine_id = st.sidebar.selectbox("Turbine", list(TURBINES), index=list(TURBINES).index("w005"))
     accel_dir = st.sidebar.text_input("Accelerometer folder", str(DEFAULT_ACCEL_DIR))
+    turbine_id = st.sidebar.selectbox("Turbine", list(TURBINES), index=list(TURBINES).index("w005"))
     scada_dir = st.sidebar.text_input("SCADA folder", str(DEFAULT_SCADA_DIR))
-    reference_dir = st.sidebar.text_input("Baseline folder", str(DEFAULT_REFERENCE_DIR))
-    use_reference_files = st.sidebar.checkbox("Use fixed baseline files", value=True)
     window_minutes = st.sidebar.selectbox("Window length", [5, 10, 20, 30], index=1)
     overlap = st.sidebar.slider("Window overlap", min_value=0.0, max_value=0.8, value=0.5, step=0.1)
 
@@ -484,8 +738,7 @@ def main() -> None:
             turbine_id,
             window_minutes,
             overlap,
-            reference_dir,
-            use_reference_files,
+            ANALYSIS_CACHE_VERSION,
         )
     except Exception as exc:
         st.error(str(exc))
@@ -506,6 +759,11 @@ def main() -> None:
 
     st.subheader("PSD")
     render_psd(result, filtered, theme)
+
+    st.subheader("Modal Diagram")
+    render_modal_diagram(result, theme)
+
+    render_weekly_report_download(result)
 
 
 if __name__ == "__main__":

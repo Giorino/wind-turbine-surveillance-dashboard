@@ -42,7 +42,7 @@ class AnalysisConfig:
     drift_alert_hz_per_day: float = 0.001
     psd_min_hz: float = 0.05
     psd_max_hz: float = 0.80
-    use_reference_files: bool = True
+    use_reference_files: bool = False
     reference_dir: str | None = None
     fdd_segment_minutes: int = 30
     fdd_overlap: float = 0.50
@@ -66,6 +66,7 @@ class AnalysisResult:
     psd_frequencies_hz: np.ndarray
     psd_ax_db: np.ndarray
     psd_ay_db: np.ndarray
+    modal: dict[str, object]
     sample_rate_hz: int
 
 
@@ -128,6 +129,14 @@ def analyze_dataset(
         sample_rate_hz=sample_rate_hz,
         config=cfg,
     )
+    modal = _modal_diagram_summary(
+        ax_filtered=ax_filtered,
+        ay_filtered=ay_filtered,
+        sample_rate_hz=sample_rate_hz,
+        config=cfg,
+        summary=summary,
+        fdd_summary=fdd_summary,
+    )
     weekly = _weekly_modal_summary(
         times_utc=times_utc,
         ax_filtered=ax_filtered,
@@ -165,6 +174,7 @@ def analyze_dataset(
         psd_frequencies_hz=psd_freqs,
         psd_ax_db=psd_ax_db,
         psd_ay_db=psd_ay_db,
+        modal=modal,
         sample_rate_hz=sample_rate_hz,
     )
 
@@ -193,14 +203,10 @@ def discover_scada_files(path: str | Path) -> list[Path]:
 
 
 def _load_reference_for_turbine(cfg: AnalysisConfig) -> ReferenceData | None:
-    if not cfg.use_reference_files:
+    if not cfg.use_reference_files or not cfg.reference_dir:
         return None
 
-    root = (
-        Path(cfg.reference_dir)
-        if cfg.reference_dir
-        else Path(__file__).resolve().parents[1] / "reference-matlab-files"
-    )
+    root = Path(cfg.reference_dir)
     if not root.exists():
         return None
 
@@ -933,6 +939,150 @@ def _fdd_modal_summary(
         "fdd_f2_half_power_hz": _rounded(f2_hp, 5),
         "fdd_segments_used": int(used),
     }
+
+
+def _modal_diagram_summary(
+    ax_filtered: np.ndarray,
+    ay_filtered: np.ndarray,
+    sample_rate_hz: int,
+    config: AnalysisConfig,
+    summary: dict[str, object],
+    fdd_summary: dict[str, object],
+) -> dict[str, object]:
+    n = len(ax_filtered)
+    if n < max(8, sample_rate_hz * 60):
+        return {"available": False, "reason": "Not enough samples for modal diagram."}
+
+    win = min(max(8, int(round(3600 * sample_rate_hz))), n)
+    step = max(1, int(round(win * 0.50)))
+    starts = np.arange(0, max(n - win + 1, 0), step, dtype=int)
+    if starts.size == 0:
+        starts = np.array([0], dtype=int)
+    selected = np.rint(np.linspace(0, starts.size - 1, min(300, starts.size))).astype(int)
+    selected_starts = starts[selected]
+
+    nfft = min(1 << int(math.ceil(math.log2(win))), 2**17)
+    freqs = np.fft.rfftfreq(nfft, d=1 / sample_rate_hz)
+    freq_mask = (freqs >= config.fdd_low_hz) & (freqs <= min(config.psd_max_hz, sample_rate_hz / 2))
+    modal_freqs = freqs[freq_mask]
+    if modal_freqs.size < 5:
+        return {"available": False, "reason": "Modal frequency range is too narrow."}
+
+    window = np.hamming(win)
+    ax_db = np.empty((selected_starts.size, modal_freqs.size), dtype=np.float32)
+    ay_db = np.empty_like(ax_db)
+    for row_idx, start in enumerate(selected_starts):
+        idx = slice(start, start + win)
+        ax_db[row_idx] = _modal_fft_amplitude_db(ax_filtered[idx], window, nfft)[freq_mask]
+        ay_db[row_idx] = _modal_fft_amplitude_db(ay_filtered[idx], window, nfft)[freq_mask]
+
+    threshold_db = _safe_percentile(ax_db, 65)
+    env_freqs, ax_env = _modal_envelopes(modal_freqs, ax_db)
+    _, ay_env = _modal_envelopes(modal_freqs, ay_db)
+    smooth_window = max(5, round(len(env_freqs) / 60))
+    ax_p90_smooth = _gaussian_smooth(ax_env["p90"], smooth_window)
+    ay_p90_smooth = _gaussian_smooth(ay_env["p90"], smooth_window)
+    ax_params = _envelope_modal_params(
+        env_freqs, ax_p90_smooth, config.f0_low_hz, config.f0_high_hz, config.half_power_bandwidth_fraction
+    )
+    ay_params = _envelope_modal_params(
+        env_freqs, ay_p90_smooth, config.f0_low_hz, config.f0_high_hz, config.half_power_bandwidth_fraction
+    )
+
+    fdd_f0 = fdd_summary.get("fdd_f0_hz")
+    fdd_zeta = fdd_summary.get("zeta_fdd_pct")
+    f0_ref_ax = summary.get("f0_ref_ax_hz")
+    f0_ref_ay = summary.get("f0_ref_ay_hz")
+
+    return {
+        "available": True,
+        "frequencies_hz": modal_freqs,
+        "ax_db": ax_db,
+        "ay_db": ay_db,
+        "threshold_db": threshold_db,
+        "env_frequencies_hz": env_freqs,
+        "ax_envelope": {**ax_env, "p90_smooth": ax_p90_smooth},
+        "ay_envelope": {**ay_env, "p90_smooth": ay_p90_smooth},
+        "ax": ax_params,
+        "ay": ay_params,
+        "window_count": int(selected_starts.size),
+        "fdd_f0_hz": fdd_f0,
+        "fdd_zeta_pct": fdd_zeta,
+        "fdd_match_ax": _frequency_match(fdd_f0, f0_ref_ax, config.f0_tolerance),
+        "fdd_match_ay": _frequency_match(fdd_f0, f0_ref_ay, config.f0_tolerance),
+    }
+
+
+def _modal_fft_amplitude_db(values: np.ndarray, window: np.ndarray, nfft: int) -> np.ndarray:
+    spectrum = np.fft.rfft(detrend(values) * window, n=nfft)
+    amplitude = np.abs(spectrum) / nfft * 2.0
+    return 20.0 * np.log10(np.maximum(amplitude, np.finfo(float).eps))
+
+
+def _modal_envelopes(freqs: np.ndarray, amplitudes_db: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    bins = 300
+    edges = np.linspace(float(np.nanmin(freqs)), float(np.nanmax(freqs)), bins + 1)
+    centers = edges[:-1] + np.diff(edges) / 2.0
+    out = {
+        "p10": np.full(bins, np.nan, dtype=float),
+        "p50": np.full(bins, np.nan, dtype=float),
+        "p90": np.full(bins, np.nan, dtype=float),
+    }
+    for idx in range(bins):
+        if idx == bins - 1:
+            mask = (freqs >= edges[idx]) & (freqs <= edges[idx + 1])
+        else:
+            mask = (freqs >= edges[idx]) & (freqs < edges[idx + 1])
+        if mask.any():
+            values = amplitudes_db[:, mask].reshape(-1)
+            out["p10"][idx] = _safe_percentile(values, 10)
+            out["p50"][idx] = _safe_percentile(values, 50)
+            out["p90"][idx] = _safe_percentile(values, 90)
+    return centers, out
+
+
+def _envelope_modal_params(
+    freqs: np.ndarray,
+    envelope: np.ndarray,
+    f0_low_hz: float,
+    f0_high_hz: float,
+    half_power_fraction: float,
+) -> dict[str, object]:
+    result = {"f0_hz": None, "zeta_pct": None, "f1_hz": None, "f2_hz": None}
+    freqs = np.asarray(freqs, dtype=float)
+    envelope = np.asarray(envelope, dtype=float)
+    band = (freqs >= f0_low_hz) & (freqs <= f0_high_hz) & np.isfinite(envelope)
+    if band.sum() < 3:
+        return result
+    band_indices = np.flatnonzero(band)
+    peak_local = int(np.nanargmax(envelope[band]))
+    peak_index = int(band_indices[peak_local])
+    peak_value = float(envelope[peak_index])
+    f0 = float(freqs[peak_index])
+    half_power_level = peak_value * half_power_fraction**2
+
+    left = np.flatnonzero(envelope[:peak_index] <= half_power_level)
+    right = np.flatnonzero(envelope[peak_index + 1 :] <= half_power_level)
+    f1 = float(freqs[left[-1]]) if left.size else np.nan
+    f2 = float(freqs[peak_index + 1 + right[0]]) if right.size else np.nan
+    zeta = np.nan
+    if np.isfinite(f1) and np.isfinite(f2) and f0 > 0:
+        zeta = float((f2 - f1) / (2 * f0) * 100.0)
+
+    return {
+        "f0_hz": _rounded(f0, 5),
+        "zeta_pct": _rounded(zeta, 3),
+        "f1_hz": _rounded(f1, 5),
+        "f2_hz": _rounded(f2, 5),
+    }
+
+
+def _frequency_match(value: object, reference: object, tolerance: float) -> bool:
+    if value is None or reference is None:
+        return False
+    value_f = float(value)
+    reference_f = float(reference)
+    return bool(np.isfinite(value_f) and np.isfinite(reference_f) and abs(value_f - reference_f) <= tolerance * reference_f)
 
 
 def _weekly_modal_summary(

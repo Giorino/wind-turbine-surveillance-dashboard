@@ -8,6 +8,7 @@ import numpy as np
 
 from wind_dashboard import AnalysisConfig, analyze_dataset
 from wind_dashboard.analysis import discover_accelerometer_files, discover_scada_files
+from wind_dashboard.reports import build_all_weekly_text_reports
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -30,13 +31,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overlap", type=float, default=0.5)
     parser.add_argument(
         "--reference-dir",
-        default=str(BASE_DIR / "reference-matlab-files"),
-        help="Folder containing REF_<turbine>_*.mat reference files.",
+        default=None,
+        help="Optional folder containing REF_<turbine>_*.mat reference files.",
     )
     parser.add_argument(
-        "--no-reference-files",
+        "--use-reference-files",
         action="store_true",
-        help="Compute the f0 reference from the current data instead of loading REF_*.mat.",
+        help="Load REF_*.mat files from --reference-dir instead of computing the baseline from current data.",
     )
     parser.add_argument("--output-dir", default=str(BASE_DIR / "outputs" / "latest_week"))
     return parser.parse_args()
@@ -54,7 +55,7 @@ def main() -> None:
         window_minutes=args.window_minutes,
         overlap=args.overlap,
         reference_dir=args.reference_dir,
-        use_reference_files=not args.no_reference_files,
+        use_reference_files=args.use_reference_files,
     )
     result = analyze_dataset(accel_files, scada_files, config)
 
@@ -62,6 +63,7 @@ def main() -> None:
     weekly_path = output_dir / "weekly_summary.csv"
     summary_path = output_dir / "summary.json"
     psd_path = output_dir / "psd_arrays.npz"
+    report_dir = output_dir / "reports"
 
     result.kpis.to_csv(kpi_path, index=False)
     result.weekly.to_csv(weekly_path, index=False)
@@ -72,11 +74,15 @@ def main() -> None:
         psd_ax_db=result.psd_ax_db,
         psd_ay_db=result.psd_ay_db,
     )
+    report_dir.mkdir(exist_ok=True)
+    for report in build_all_weekly_text_reports(result):
+        (report_dir / report.filename).write_text(report.content, encoding="utf-8")
 
     print(f"Wrote {kpi_path}")
     print(f"Wrote {weekly_path}")
     print(f"Wrote {summary_path}")
     print(f"Wrote {psd_path}")
+    print(f"Wrote weekly reports to {report_dir}")
     print(
         "Weekly baseline: "
         f"AX={result.summary.get('latest_week_f0_ax_hz')} Hz, "
