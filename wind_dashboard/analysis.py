@@ -123,6 +123,7 @@ class AnalysisConfig:
 @dataclass
 class AnalysisResult:
     kpis: pd.DataFrame
+    daily: pd.DataFrame
     weekly: pd.DataFrame
     summary: dict[str, object]
     psd_frequencies_hz: np.ndarray
@@ -199,13 +200,23 @@ def analyze_dataset(
         summary=summary,
         fdd_summary=fdd_summary,
     )
-    weekly = _weekly_modal_summary(
+    daily = _period_modal_summary(
         times_utc=times_utc,
         ax_filtered=ax_filtered,
         ay_filtered=ay_filtered,
         kpis=kpis,
         sample_rate_hz=sample_rate_hz,
         config=cfg,
+        period="daily",
+    )
+    weekly = _period_modal_summary(
+        times_utc=times_utc,
+        ax_filtered=ax_filtered,
+        ay_filtered=ay_filtered,
+        kpis=kpis,
+        sample_rate_hz=sample_rate_hz,
+        config=cfg,
+        period="weekly",
     )
     summary.update(
         {
@@ -214,15 +225,27 @@ def analyze_dataset(
             "accelerometer_rows": int(len(acc)),
             "scada_rows": int(len(scada)),
             **fdd_summary,
+            "daily_count": int(len(daily)),
             "weekly_count": int(len(weekly)),
         }
     )
+    if not daily.empty:
+        latest_day = daily.iloc[-1]
+        summary.update(
+            {
+                "latest_day_start_utc": latest_day["period_start_utc"].isoformat(),
+                "latest_day_end_utc": latest_day["period_end_utc"].isoformat(),
+                "latest_day_f0_ax_hz": _rounded(latest_day["f0_baseline_ax_hz"], 5),
+                "latest_day_f0_ay_hz": _rounded(latest_day["f0_baseline_ay_hz"], 5),
+                "latest_day_zeta_pct": _rounded(latest_day["zeta_fdd_pct"], 3),
+            }
+        )
     if not weekly.empty:
         latest_week = weekly.iloc[-1]
         summary.update(
             {
-                "latest_week_start_utc": latest_week["week_start_utc"].isoformat(),
-                "latest_week_end_utc": latest_week["week_end_utc"].isoformat(),
+                "latest_week_start_utc": latest_week["period_start_utc"].isoformat(),
+                "latest_week_end_utc": latest_week["period_end_utc"].isoformat(),
                 "latest_week_f0_ax_hz": _rounded(latest_week["f0_baseline_ax_hz"], 5),
                 "latest_week_f0_ay_hz": _rounded(latest_week["f0_baseline_ay_hz"], 5),
                 "latest_week_zeta_pct": _rounded(latest_week["zeta_fdd_pct"], 3),
@@ -231,6 +254,7 @@ def analyze_dataset(
 
     return AnalysisResult(
         kpis=kpis,
+        daily=daily,
         weekly=weekly,
         summary=summary,
         psd_frequencies_hz=psd_freqs,
@@ -1189,17 +1213,18 @@ def _frequency_match(value: object, reference: object, tolerance: float) -> bool
     return bool(np.isfinite(value_f) and np.isfinite(reference_f) and abs(value_f - reference_f) <= tolerance * reference_f)
 
 
-def _weekly_modal_summary(
+def _period_modal_summary(
     times_utc: pd.DatetimeIndex,
     ax_filtered: np.ndarray,
     ay_filtered: np.ndarray,
     kpis: pd.DataFrame,
     sample_rate_hz: int,
     config: AnalysisConfig,
+    period: str,
 ) -> pd.DataFrame:
     columns = [
-        "week_start_utc",
-        "week_end_utc",
+        "period_start_utc",
+        "period_end_utc",
         "window_count",
         "stable_count",
         "f0_baseline_ax_hz",
@@ -1215,14 +1240,21 @@ def _weekly_modal_summary(
     if kpis.empty:
         return pd.DataFrame(columns=columns)
 
-    week_start = _week_start_utc(kpis["time_utc"])
-    frame = kpis.assign(week_start_utc=week_start)
+    if period == "daily":
+        period_start = _day_start_utc(kpis["time_utc"])
+        period_length = pd.Timedelta(days=1)
+    elif period == "weekly":
+        period_start = _week_start_utc(kpis["time_utc"])
+        period_length = pd.Timedelta(days=7)
+    else:
+        raise ValueError(f"Unsupported period {period!r}")
+    frame = kpis.assign(period_start_utc=period_start)
     rows: list[dict[str, object]] = []
 
-    for week, group in frame.groupby("week_start_utc", sort=True):
-        week = pd.Timestamp(week)
-        week_end = week + pd.Timedelta(days=7)
-        sample_mask = (times_utc >= week) & (times_utc < week_end)
+    for period_start_value, group in frame.groupby("period_start_utc", sort=True):
+        period_start_ts = pd.Timestamp(period_start_value)
+        period_end_ts = period_start_ts + period_length
+        sample_mask = (times_utc >= period_start_ts) & (times_utc < period_end_ts)
         stable = group["is_stable"].to_numpy(dtype=bool) if "is_stable" in group else np.ones(len(group), dtype=bool)
         ax_values = group["f0_ax_hz"].to_numpy(dtype=float)
         ay_values = group["f0_ay_hz"].to_numpy(dtype=float)
@@ -1239,8 +1271,11 @@ def _weekly_modal_summary(
         )
         rows.append(
             {
-                "week_start_utc": week,
-                "week_end_utc": min(week_end, pd.Timestamp(group["time_utc"].max()) + pd.Timedelta(minutes=config.window_minutes)),
+                "period_start_utc": period_start_ts,
+                "period_end_utc": min(
+                    period_end_ts,
+                    pd.Timestamp(group["time_utc"].max()) + pd.Timedelta(minutes=config.window_minutes),
+                ),
                 "window_count": int(len(group)),
                 "stable_count": int(stable.sum()),
                 "f0_baseline_ax_hz": _rounded(_safe_median(ax_values[ax_ok]), 5),
@@ -1253,14 +1288,14 @@ def _weekly_modal_summary(
             }
         )
 
-    weekly = pd.DataFrame(rows)
-    if weekly.empty:
+    periods = pd.DataFrame(rows)
+    if periods.empty:
         return pd.DataFrame(columns=columns)
-    weekly["f0_shift_ax_hz"] = weekly["f0_baseline_ax_hz"].astype(float).diff()
-    weekly["f0_shift_ay_hz"] = weekly["f0_baseline_ay_hz"].astype(float).diff()
-    weekly["f0_shift_ax_hz"] = weekly["f0_shift_ax_hz"].map(lambda value: _rounded(value, 6))
-    weekly["f0_shift_ay_hz"] = weekly["f0_shift_ay_hz"].map(lambda value: _rounded(value, 6))
-    return weekly.reindex(columns=columns)
+    periods["f0_shift_ax_hz"] = periods["f0_baseline_ax_hz"].astype(float).diff()
+    periods["f0_shift_ay_hz"] = periods["f0_baseline_ay_hz"].astype(float).diff()
+    periods["f0_shift_ax_hz"] = periods["f0_shift_ax_hz"].map(lambda value: _rounded(value, 6))
+    periods["f0_shift_ay_hz"] = periods["f0_shift_ay_hz"].map(lambda value: _rounded(value, 6))
+    return periods.reindex(columns=columns)
 
 
 def _datetime_ns(values: object) -> np.ndarray:
@@ -1339,6 +1374,10 @@ def _week_start_utc(times: pd.Series) -> pd.Series:
     series = pd.to_datetime(times, utc=True)
     normalized = series.dt.normalize()
     return normalized - pd.to_timedelta(normalized.dt.weekday, unit="D")
+
+
+def _day_start_utc(times: pd.Series) -> pd.Series:
+    return pd.to_datetime(times, utc=True).dt.normalize()
 
 
 def _window_drift(times: pd.Series, values: np.ndarray, mask: np.ndarray) -> float:

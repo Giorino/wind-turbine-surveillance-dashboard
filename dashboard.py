@@ -165,8 +165,8 @@ def apply_theme() -> dict[str, object]:
     return theme
 
 
-@st.cache_data(show_spinner="Computing weekly turbine KPIs...")
-def load_weekly_result(
+@st.cache_data(show_spinner="Computing turbine KPIs...")
+def load_analysis_result(
     accel_dir: str,
     scada_dir: str,
     turbine_id: str,
@@ -218,17 +218,34 @@ def apply_filters(kpis: pd.DataFrame) -> pd.DataFrame:
     return kpis
 
 
-def render_summary(result, filtered: pd.DataFrame) -> None:
+def _period_frame(result, period_mode: str) -> pd.DataFrame:
+    return result.daily if period_mode == "Daily" else result.weekly
+
+
+def _period_suffix(period_mode: str) -> str:
+    return "day" if period_mode == "Daily" else "week"
+
+
+def render_summary(result, filtered: pd.DataFrame, period_mode: str) -> None:
     summary = result.summary
-    latest_week = result.weekly.iloc[-1] if not result.weekly.empty else None
+    del filtered
+    periods = _period_frame(result, period_mode)
+    latest_period = periods.iloc[-1] if not periods.empty else None
+    suffix = _period_suffix(period_mode)
     items = [
         ("Turbine", summary["turbine_id"]),
         ("Sample rate", f"{summary['sample_rate_hz']} Hz"),
         ("f0 AX baseline", _fmt(summary.get("f0_ref_ax_hz"), " Hz", 4)),
         ("f0 AY baseline", _fmt(summary.get("f0_ref_ay_hz"), " Hz", 4)),
-        ("Weekly zeta", _fmt(None if latest_week is None else latest_week.get("zeta_fdd_pct"), "%", 2)),
-        ("Weekly AX shift", _fmt(None if latest_week is None else latest_week.get("f0_shift_ax_hz"), " Hz/week", 5)),
-        ("Weekly AY shift", _fmt(None if latest_week is None else latest_week.get("f0_shift_ay_hz"), " Hz/week", 5)),
+        (f"{period_mode} zeta", _fmt(None if latest_period is None else latest_period.get("zeta_fdd_pct"), "%", 2)),
+        (
+            f"{period_mode} AX shift",
+            _fmt(None if latest_period is None else latest_period.get("f0_shift_ax_hz"), f" Hz/{suffix}", 5),
+        ),
+        (
+            f"{period_mode} AY shift",
+            _fmt(None if latest_period is None else latest_period.get("f0_shift_ay_hz"), f" Hz/{suffix}", 5),
+        ),
     ]
     cards = "".join(
         f'<div class="summary-card"><div class="summary-label">{escape(str(label))}</div>'
@@ -246,8 +263,8 @@ def render_weekly_report_download(result) -> None:
     options = [
         (
             index,
-            f"{pd.Timestamp(row['week_start_utc']).strftime('%Y-%m-%d')} to "
-            f"{pd.Timestamp(row['week_end_utc']).strftime('%Y-%m-%d')}",
+            f"{pd.Timestamp(row['period_start_utc']).strftime('%Y-%m-%d')} to "
+            f"{pd.Timestamp(row['period_end_utc']).strftime('%Y-%m-%d')}",
         )
         for index, row in result.weekly.iterrows()
     ]
@@ -267,7 +284,7 @@ def render_weekly_report_download(result) -> None:
         st.code(report.content, language="text")
 
 
-def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object]) -> None:
+def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object], period_mode: str) -> None:
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -277,7 +294,7 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object]) -> Non
         specs=[[{}], [{"secondary_y": True}]],
         subplot_titles=(
             "Frequency Drift",
-            "Weekly Baseline And Zeta",
+            f"{period_mode} Baseline And Zeta",
         ),
     )
 
@@ -307,20 +324,20 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object]) -> Non
                     col=1,
                 )
 
-    weekly = result.weekly.copy()
-    if not weekly.empty and not df.empty:
+    periods = _period_frame(result, period_mode).copy()
+    if not periods.empty and not df.empty:
         visible_start = df["time_utc"].min()
         visible_end = df["time_utc"].max()
-        weekly = weekly[
-            (weekly["week_end_utc"] >= visible_start) & (weekly["week_start_utc"] <= visible_end)
+        periods = periods[
+            (periods["period_end_utc"] >= visible_start) & (periods["period_start_utc"] <= visible_end)
         ]
-    if not weekly.empty:
+    if not periods.empty:
         fig.add_trace(
             go.Scatter(
-                x=weekly["week_start_utc"],
-                y=weekly["f0_baseline_ax_hz"],
+                x=periods["period_start_utc"],
+                y=periods["f0_baseline_ax_hz"],
                 mode="markers+lines",
-                name="Weekly f0 AX",
+                name=f"{period_mode} f0 AX",
                 marker={"color": "#2563eb", "size": 8},
                 line={"color": "#2563eb", "width": 1.8},
             ),
@@ -330,10 +347,10 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object]) -> Non
         )
         fig.add_trace(
             go.Scatter(
-                x=weekly["week_start_utc"],
-                y=weekly["f0_baseline_ay_hz"],
+                x=periods["period_start_utc"],
+                y=periods["f0_baseline_ay_hz"],
                 mode="markers+lines",
-                name="Weekly f0 AY",
+                name=f"{period_mode} f0 AY",
                 marker={"color": "#15803d", "size": 8},
                 line={"color": "#15803d", "width": 1.8},
             ),
@@ -343,8 +360,8 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object]) -> Non
         )
         fig.add_trace(
             go.Scatter(
-                x=weekly["week_start_utc"],
-                y=weekly["zeta_fdd_pct"],
+                x=periods["period_start_utc"],
+                y=periods["zeta_fdd_pct"],
                 mode="markers+lines",
                 name="Zeta FDD",
                 marker={"color": "#7c3aed", "size": 8},
@@ -747,11 +764,12 @@ def main() -> None:
     scada_dir = scada_dir_for_dataset(dataset_dir)
     st.sidebar.caption(f"Accelerometer: {accel_dir}")
     st.sidebar.caption(f"SCADA: {scada_dir}")
+    period_mode = st.sidebar.selectbox("Aggregation", ["Weekly", "Daily"], index=0)
     window_minutes = st.sidebar.selectbox("Window length", [5, 10, 20, 30], index=1)
     overlap = st.sidebar.slider("Window overlap", min_value=0.0, max_value=0.8, value=0.5, step=0.1)
 
     try:
-        result = load_weekly_result(
+        result = load_analysis_result(
             str(accel_dir),
             str(scada_dir),
             turbine_id,
@@ -770,8 +788,8 @@ def main() -> None:
         st.warning("No windows match the current filters.")
         return
 
-    render_summary(result, filtered)
-    render_drift_plot(result, filtered, theme)
+    render_summary(result, filtered, period_mode)
+    render_drift_plot(result, filtered, theme, period_mode)
 
     st.subheader("Wind, RPM, Power")
     render_operating_context(filtered, theme)
