@@ -102,9 +102,7 @@ The selected folder must contain turbine folders such as `data5` and a `SCADA` f
 
 **Frequency Drift** shows detected modal frequencies for AX and AY over time, together with trend lines and the current reference baseline.
 
-**Weekly Baseline And Zeta** shows weekly AX/AY baseline frequency and FDD damping coefficient `zeta`. The summary cards also show weekly frequency shift in `Hz/week`.
-
-**Wind, RPM, Power** shows the operating context from SCADA. If rotor speed is not available, RPM is estimated. Parked or non-operating periods are shaded on this graph.
+**Weekly Baselines** shows weekly AX/AY baseline frequency. The summary cards also show weekly frequency shift in `Hz/week`.
 
 **PSD** shows the power spectral density over time for AX or AY.
 

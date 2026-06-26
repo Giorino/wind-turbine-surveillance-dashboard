@@ -237,7 +237,6 @@ def render_summary(result, filtered: pd.DataFrame, period_mode: str) -> None:
         ("Sample rate", f"{summary['sample_rate_hz']} Hz"),
         ("f0 AX baseline", _fmt(summary.get("f0_ref_ax_hz"), " Hz", 4)),
         ("f0 AY baseline", _fmt(summary.get("f0_ref_ay_hz"), " Hz", 4)),
-        (f"{period_mode} zeta", _fmt(None if latest_period is None else latest_period.get("zeta_fdd_pct"), "%", 2)),
         (
             f"{period_mode} AX shift",
             _fmt(None if latest_period is None else latest_period.get("f0_shift_ax_hz"), f" Hz/{suffix}", 5),
@@ -294,7 +293,7 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object], period
         specs=[[{}], [{"secondary_y": True}]],
         subplot_titles=(
             "Frequency Drift",
-            f"{period_mode} Baseline And Zeta",
+            f"{period_mode} Baselines",
         ),
     )
 
@@ -358,23 +357,8 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object], period
             col=1,
             secondary_y=False,
         )
-        fig.add_trace(
-            go.Scatter(
-                x=periods["period_start_utc"],
-                y=periods["zeta_fdd_pct"],
-                mode="markers+lines",
-                name="Zeta FDD",
-                marker={"color": "#7c3aed", "size": 8},
-                line={"color": "#7c3aed", "width": 1.8},
-            ),
-            row=2,
-            col=1,
-            secondary_y=True,
-        )
-
     fig.update_yaxes(title_text="Hz", row=1, col=1)
     fig.update_yaxes(title_text="Hz", row=2, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="%", row=2, col=1, secondary_y=True)
     _style_plot(
         fig,
         theme,
@@ -384,27 +368,6 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object], period
         legend={"orientation": "h", "y": -0.08},
     )
     st.plotly_chart(fig, width="stretch")
-
-
-def render_operating_context(df: pd.DataFrame, theme: dict[str, object]) -> None:
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(_line(df, "power_kw", "Generated power", str(theme["text"])), secondary_y=False)
-    fig.add_trace(_line(df, "wind_ms", "Wind", "#0891b2"), secondary_y=True)
-    fig.add_trace(_line(df, "rpm", "RPM", "#7c3aed"), secondary_y=True)
-    _add_stopped_regions(fig, df, theme)
-    fig.update_yaxes(title_text="kW", secondary_y=False)
-    fig.update_yaxes(title_text="m/s, rpm", secondary_y=True)
-    _style_plot(
-        fig,
-        theme,
-        height=340,
-        margin={"l": 32, "r": 28, "t": 10, "b": 28},
-        hovermode="x unified",
-        legend={"orientation": "h", "y": -0.16},
-    )
-    st.plotly_chart(fig, width="stretch")
-
-
 def render_psd(result, df: pd.DataFrame, theme: dict[str, object]) -> None:
     if df.empty:
         return
@@ -790,9 +753,6 @@ def main() -> None:
 
     render_summary(result, filtered, period_mode)
     render_drift_plot(result, filtered, theme, period_mode)
-
-    st.subheader("Wind, RPM, Power")
-    render_operating_context(filtered, theme)
 
     st.subheader("PSD")
     render_psd(result, filtered, theme)
