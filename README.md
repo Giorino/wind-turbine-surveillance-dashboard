@@ -98,9 +98,33 @@ D:\projects\turbine-dataset
 
 The selected folder must contain turbine folders such as `data5` and a `SCADA` folder. The turbine dropdown is created from those folders.
 
+## Using MATLAB Reference Files
+
+There is no separate installation step for reference files. Keep the MATLAB reference `.mat` file on your machine and select it from the sidebar when needed.
+
+In the sidebar:
+
+`Use external reference file (.mat)` enables loading a precomputed MATLAB reference file. The dashboard does not compute a replacement reference by itself.
+
+`Reference file (.mat)` stays empty when the app opens. After you enable the checkbox, use the file picker next to that field to choose a single `REF_<turbine>_*.mat` file from Finder on macOS or File Explorer on Windows.
+
+If the checkbox is off, the dashboard ignores the reference file selection and runs without a loaded reference file.
+
+If the checkbox is on but no file is selected, the dashboard does not create a replacement reference. It continues without a loaded reference file.
+
+Without a loaded reference file:
+
+`f0` reference lines and tolerance bounds are not shown.
+
+reference-based out-of-tolerance markers are not shown.
+
+reference-based threshold comparisons do not run.
+
+If a matching `.mat` file is found but cannot be read correctly, the dashboard shows an error because the external reference file is present but invalid.
+
 ## Dashboard Graphs
 
-**Frequency Drift** shows detected modal frequencies for AX and AY over time, together with trend lines and the current reference baseline.
+**Frequency Drift** shows detected modal frequencies for AX and AY over time, together with trend lines. When a reference file is loaded, it also shows the fixed reference baseline, the reference tolerance band, and out-of-tolerance markers.
 
 **Weekly Baselines** shows weekly AX/AY baseline frequency. The summary cards also show weekly frequency shift in `Hz/week`.
 

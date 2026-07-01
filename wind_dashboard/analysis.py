@@ -297,7 +297,11 @@ def _load_reference_for_turbine(cfg: AnalysisConfig) -> ReferenceData | None:
         return None
 
     turbine_id = cfg.turbine_id.lower()
-    candidates = sorted(root.glob(f"REF_{turbine_id.upper()}_*.mat"))
+    pattern = f"REF_{turbine_id.upper()}_*.mat"
+    if root.is_file():
+        candidates = [root]
+    else:
+        candidates = sorted(root.rglob(pattern))
     if not candidates:
         return None
     path = max(candidates, key=lambda item: item.stat().st_mtime)
@@ -803,22 +807,9 @@ def _classify_windows(
     if np.isfinite(amp_thr_ay):
         f0ay_fbl &= (kpis["rms_ay"] >= amp_thr_ay).to_numpy()
 
-    mask_ref_f0 = mask_ref & f0ax_fbl & f0ay_fbl
-    if has_wind:
-        wind_ctx = ((kpis["wind_ms"] > 5) & (kpis["wind_ms"] < 9)).to_numpy()
-        if (mask_ref_f0 & wind_ctx).sum() >= 10:
-            mask_ref_f0 &= wind_ctx
-
-    f0_ref_ax = _safe_median(kpis.loc[mask_ref_f0, "f0_ax_hz"])
-    f0_ref_ay = _safe_median(kpis.loc[mask_ref_f0, "f0_ay_hz"])
-    if not np.isfinite(f0_ref_ax):
-        f0_ref_ax = _safe_median(kpis.loc[f0ax_fbl, "f0_ax_hz"])
-    if not np.isfinite(f0_ref_ay):
-        f0_ref_ay = _safe_median(kpis.loc[f0ay_fbl, "f0_ay_hz"])
-    internal_f0_ref_ax = f0_ref_ax
-    internal_f0_ref_ay = f0_ref_ay
-
-    reference_source = "internal"
+    f0_ref_ax = np.nan
+    f0_ref_ay = np.nan
+    reference_source = "none"
     reference_path = None
     if reference is not None:
         ref_matches = reference.turbine_id in {None, turbine.turbine_id.lower()}
@@ -899,6 +890,8 @@ def _classify_windows(
     kpis["f0_ax_high_hz"] = f0_hi_ax
     kpis["f0_ay_low_hz"] = f0_lo_ay
     kpis["f0_ay_high_hz"] = f0_hi_ay
+    kpis["f0_ax_visible"] = f0ax_fbl & mask_stable
+    kpis["f0_ay_visible"] = f0ay_fbl & mask_stable
     kpis["f0_ax_outlier"] = hb_ax
     kpis["f0_ay_outlier"] = hb_ay
     kpis["alert_f0"] = alert_f0
@@ -930,8 +923,6 @@ def _classify_windows(
         "stable_count": int(mask_stable.sum()),
         "f0_ref_ax_hz": _rounded(f0_ref_ax, 5),
         "f0_ref_ay_hz": _rounded(f0_ref_ay, 5),
-        "internal_f0_ref_ax_hz": _rounded(internal_f0_ref_ax, 5),
-        "internal_f0_ref_ay_hz": _rounded(internal_f0_ref_ay, 5),
         "reference_source": reference_source,
         "reference_path": reference_path,
         "drift_ax_hz_per_day": _rounded(drift_ax, 6),
@@ -1429,72 +1420,39 @@ def _rms_thresholds(
     else:
         bin_id[mask_stable] = 1
 
+    ref_columns = {
+        "p95_ax": ("p95_ax", "rep_ax95"),
+        "p99_ax": ("p99_ax", "rep_ax99"),
+        "p95_ay": ("p95_ay", "rep_ay95"),
+        "p99_ay": ("p99_ay", "rep_ay99"),
+        "p95_bb": ("p95_bb", "rep_bb95"),
+        "p99_bb": ("p99_bb", "rep_bb99"),
+        "p95_bf_ax": ("p95_bf_ax", "rep_bf_ax95"),
+        "p99_bf_ax": ("p99_bf_ax", "rep_bf_ax99"),
+        "p95_bf_ay": ("p95_bf_ay", "rep_bf_ay95"),
+        "p99_bf_ay": ("p99_bf_ay", "rep_bf_ay99"),
+        "p95_res_ax": ("p95_res_ax", "rep_res_ax95"),
+        "p99_res_ax": ("p99_res_ax", "rep_res_ax99"),
+        "p95_res_ay": ("p95_res_ay", "rep_res_ay95"),
+        "p99_res_ay": ("p99_res_ay", "rep_res_ay99"),
+    }
     thresholds: dict[str, np.ndarray] = {}
-    if reference is not None:
-        ref_columns = {
-            "p95_ax": ("p95_ax", "rep_ax95"),
-            "p99_ax": ("p99_ax", "rep_ax99"),
-            "p95_ay": ("p95_ay", "rep_ay95"),
-            "p99_ay": ("p99_ay", "rep_ay99"),
-            "p95_bb": ("p95_bb", "rep_bb95"),
-            "p99_bb": ("p99_bb", "rep_bb99"),
-            "p95_bf_ax": ("p95_bf_ax", "rep_bf_ax95"),
-            "p99_bf_ax": ("p99_bf_ax", "rep_bf_ax99"),
-            "p95_bf_ay": ("p95_bf_ay", "rep_bf_ay95"),
-            "p99_bf_ay": ("p99_bf_ay", "rep_bf_ay99"),
-            "p95_res_ax": ("p95_res_ax", "rep_res_ax95"),
-            "p99_res_ax": ("p99_res_ax", "rep_res_ax99"),
-            "p95_res_ay": ("p95_res_ay", "rep_res_ay95"),
-            "p99_res_ay": ("p99_res_ay", "rep_res_ay99"),
-        }
-        for output_column, (source_name, fallback_name) in ref_columns.items():
-            source_values = np.asarray(reference.thresholds.get(source_name, []), dtype=float)
-            fallback = float(reference.fallback_thresholds.get(fallback_name, np.nan))
-            out = np.full(n, np.nan)
-            for row, bin_value in enumerate(bin_id):
-                if bin_value <= 0:
-                    continue
-                idx = bin_value - 1
-                value = source_values[idx] if idx < source_values.size else np.nan
-                out[row] = value if np.isfinite(value) else fallback
-            thresholds[output_column] = out
+    if reference is None:
+        for output_column in ref_columns:
+            thresholds[output_column] = np.full(n, np.nan)
         return bin_id, thresholds
 
-    source_cols = {
-        "ax": "rms_ax",
-        "ay": "rms_ay",
-        "bb": "broadband_ax",
-        "bf_ax": "rms_bf_ax",
-        "bf_ay": "rms_bf_ay",
-        "res_ax": "rms_res_ax",
-        "res_ay": "rms_res_ay",
-    }
-    for suffix, source in source_cols.items():
-        p95 = np.full(nb, np.nan)
-        p99 = np.full(nb, np.nan)
-        values = kpis[source].to_numpy(dtype=float)
-        for idx in range(nb):
-            matched = mask_ref & (bin_id == idx + 1)
-            if matched.sum() >= 5:
-                p95[idx] = np.nanpercentile(values[matched], 95)
-                p99[idx] = np.nanpercentile(values[matched], 99.5)
-        fallback95 = _safe_percentile(values[mask_ref], 95)
-        fallback99 = _safe_percentile(values[mask_ref], 99.5)
-        if not np.isfinite(fallback95):
-            fallback95 = _safe_percentile(values[mask_stable], 95)
-        if not np.isfinite(fallback99):
-            fallback99 = _safe_percentile(values[mask_stable], 99.5)
-
-        out95 = np.full(n, np.nan)
-        out99 = np.full(n, np.nan)
-        for row in range(n):
-            b = bin_id[row]
-            if b > 0:
-                out95[row] = p95[b - 1] if np.isfinite(p95[b - 1]) else fallback95
-                out99[row] = p99[b - 1] if np.isfinite(p99[b - 1]) else fallback99
-        thresholds[f"p95_{suffix}"] = out95
-        thresholds[f"p99_{suffix}"] = out99
-
+    for output_column, (source_name, fallback_name) in ref_columns.items():
+        source_values = np.asarray(reference.thresholds.get(source_name, []), dtype=float)
+        fallback = float(reference.fallback_thresholds.get(fallback_name, np.nan))
+        out = np.full(n, np.nan)
+        for row, bin_value in enumerate(bin_id):
+            if bin_value <= 0:
+                continue
+            idx = bin_value - 1
+            value = source_values[idx] if idx < source_values.size else np.nan
+            out[row] = value if np.isfinite(value) else fallback
+        thresholds[output_column] = out
     return bin_id, thresholds
 
 

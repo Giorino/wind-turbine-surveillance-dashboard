@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import tempfile
 from datetime import timedelta
 from html import escape
 from pathlib import Path
@@ -23,7 +25,7 @@ from wind_dashboard.reports import build_weekly_text_report
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATASET_DIR = BASE_DIR / "dataset"
-ANALYSIS_CACHE_VERSION = 9
+ANALYSIS_CACHE_VERSION = 11
 
 
 st.set_page_config(
@@ -105,6 +107,41 @@ def apply_theme() -> dict[str, object]:
             background: {theme["input_bg"]} !important;
             border-color: {theme["muted"]} !important;
         }}
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] > label {{
+            display: none !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] small {{
+            display: none !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] {{
+            min-height: auto !important;
+            padding: 0 !important;
+            border: none !important;
+            background: transparent !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] > div {{
+            padding: 0 !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] {{
+            display: none !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] button {{
+            width: 100% !important;
+            min-height: 2.5rem !important;
+            padding: 0.45rem 0.65rem !important;
+            border: 1px solid {theme["border"]} !important;
+            border-radius: 6px !important;
+            background: {theme["panel_bg"]} !important;
+            color: transparent !important;
+            font-size: 0 !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] button::before {{
+            content: "+" !important;
+            color: {theme["text"]} !important;
+            font-size: 1.35rem !important;
+            font-weight: 600 !important;
+            line-height: 1 !important;
+        }}
         [data-testid="stExpander"] details {{
             background: {theme["panel_bg"]} !important;
             border: 1px solid {theme["border"]} !important;
@@ -172,6 +209,8 @@ def load_analysis_result(
     turbine_id: str,
     window_minutes: int,
     overlap: float,
+    reference_dir: str | None,
+    use_reference_files: bool,
     analysis_cache_version: int,
 ):
     _ = analysis_cache_version
@@ -184,10 +223,34 @@ def load_analysis_result(
         turbine_id=turbine_id,
         window_minutes=window_minutes,
         overlap=overlap,
-        reference_dir=None,
-        use_reference_files=False,
+        reference_dir=reference_dir,
+        use_reference_files=use_reference_files,
     )
     return analyze_dataset(accel_files, scada_files, config)
+
+
+def _persist_uploaded_reference(uploaded_file) -> tuple[str | None, str]:
+    if uploaded_file is None:
+        return None, ""
+    payload = uploaded_file.getvalue()
+    digest = hashlib.sha1(payload).hexdigest()[:12]
+    filename = Path(uploaded_file.name).name or "reference.mat"
+    temp_root = Path(tempfile.gettempdir()) / "wind-dashboard-reference"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    path = temp_root / f"{digest}_{filename}"
+    if not path.exists():
+        path.write_bytes(payload)
+    return str(path), filename
+
+
+def _recover_persisted_reference_path(filename: str) -> str:
+    if not filename:
+        return ""
+    temp_root = Path(tempfile.gettempdir()) / "wind-dashboard-reference"
+    if not temp_root.exists():
+        return ""
+    matches = sorted(temp_root.glob(f"*_{filename}"), key=lambda item: item.stat().st_mtime, reverse=True)
+    return str(matches[0]) if matches else ""
 
 
 def utc_date_bounds(series: pd.Series) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -232,11 +295,13 @@ def render_summary(result, filtered: pd.DataFrame, period_mode: str) -> None:
     periods = _period_frame(result, period_mode)
     latest_period = periods.iloc[-1] if not periods.empty else None
     suffix = _period_suffix(period_mode)
+    current_ax = None if latest_period is None else latest_period.get("f0_baseline_ax_hz")
+    current_ay = None if latest_period is None else latest_period.get("f0_baseline_ay_hz")
     items = [
         ("Turbine", summary["turbine_id"]),
         ("Sample rate", f"{summary['sample_rate_hz']} Hz"),
-        ("f0 AX baseline", _fmt(summary.get("f0_ref_ax_hz"), " Hz", 4)),
-        ("f0 AY baseline", _fmt(summary.get("f0_ref_ay_hz"), " Hz", 4)),
+        ("Current f0 AX", _fmt(current_ax, " Hz", 4)),
+        ("Current f0 AY", _fmt(current_ay, " Hz", 4)),
         (
             f"{period_mode} AX shift",
             _fmt(None if latest_period is None else latest_period.get("f0_shift_ax_hz"), f" Hz/{suffix}", 5),
@@ -297,31 +362,71 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object], period
         ),
     )
 
-    valid_ax = df[df["f0_ax_hz"].notna()].copy()
-    valid_ay = df[df["f0_ay_hz"].notna()].copy()
-    fig.add_trace(_markers(valid_ax, "f0 AX", "#93c5fd", "f0_ax_hz", size=4, opacity=0.38), row=1, col=1)
-    fig.add_trace(_markers(valid_ay, "f0 AY", "#86efac", "f0_ay_hz", size=4, opacity=0.38), row=1, col=1)
+    _add_reference_overlay(
+        fig,
+        df,
+        "f0_ax_low_hz",
+        "f0_ax_high_hz",
+        result.summary.get("f0_ref_ax_hz"),
+        "#1d4ed8",
+        "AX",
+        row=1,
+    )
+    _add_reference_overlay(
+        fig,
+        df,
+        "f0_ay_low_hz",
+        "f0_ay_high_hz",
+        result.summary.get("f0_ref_ay_hz"),
+        "#166534",
+        "AY",
+        row=1,
+    )
+
+    raw_ax = df[df["f0_ax_hz"].notna()].copy()
+    raw_ay = df[df["f0_ay_hz"].notna()].copy()
+    ax_outlier = _frame_outlier_mask(raw_ax, "f0_ax_hz", "f0_ax_low_hz", "f0_ax_high_hz")
+    ay_outlier = _frame_outlier_mask(raw_ay, "f0_ay_hz", "f0_ay_low_hz", "f0_ay_high_hz")
+
     fig.add_trace(_line(df, "f0_ax_trend_hz", "AX trend", "#1d4ed8"), row=1, col=1)
     fig.add_trace(_line(df, "f0_ay_trend_hz", "AY trend", "#166534"), row=1, col=1)
-
-    if not df.empty:
-        x0, x1 = df["time_utc"].min(), df["time_utc"].max()
-        for value, name, color in (
-            (result.summary.get("f0_ref_ax_hz"), "AX baseline", "#93c5fd"),
-            (result.summary.get("f0_ref_ay_hz"), "AY baseline", "#86efac"),
-        ):
-            if value is not None and np.isfinite(float(value)):
-                fig.add_trace(
-                    go.Scatter(
-                        x=[x0, x1],
-                        y=[float(value), float(value)],
-                        mode="lines",
-                        name=name,
-                        line={"color": color, "width": 1.4, "dash": "dash"},
-                    ),
-                    row=1,
-                    col=1,
-                )
+    fig.add_trace(
+        _markers(raw_ax.loc[~ax_outlier], "f0 AX points", "#93c5fd", "f0_ax_hz", size=4, opacity=0.22, symbol="circle"),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        _markers(raw_ay.loc[~ay_outlier], "f0 AY points", "#86efac", "f0_ay_hz", size=4, opacity=0.22, symbol="diamond"),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        _markers(
+            raw_ax.loc[ax_outlier],
+            "f0 AX out of tolerance",
+            "#dc2626",
+            "f0_ax_hz",
+            size=10,
+            opacity=0.95,
+            symbol="circle",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        _markers(
+            raw_ay.loc[ay_outlier],
+            "f0 AY out of tolerance",
+            "#dc2626",
+            "f0_ay_hz",
+            size=10,
+            opacity=0.95,
+            symbol="diamond",
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
 
     periods = _period_frame(result, period_mode).copy()
     if not periods.empty and not df.empty:
@@ -368,6 +473,15 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object], period
         legend={"orientation": "h", "y": -0.08},
     )
     st.plotly_chart(fig, width="stretch")
+
+    source_label = _baseline_source_label(result.summary.get("reference_source"))
+    reference_path = result.summary.get("reference_path")
+    if reference_path:
+        st.caption(f"Reference source: {source_label} | {reference_path}")
+    else:
+        st.caption(f"Reference source: {source_label}")
+
+
 def render_psd(result, df: pd.DataFrame, theme: dict[str, object]) -> None:
     if df.empty:
         return
@@ -610,13 +724,97 @@ def _markers(
     *,
     size: int,
     opacity: float = 0.9,
+    symbol: str = "circle",
+    showlegend: bool = True,
 ) -> go.Scattergl:
     return go.Scattergl(
         x=df["time_utc"],
         y=df[column],
         mode="markers",
         name=name,
-        marker={"color": color, "size": size, "opacity": opacity},
+        showlegend=showlegend,
+        marker={"color": color, "size": size, "opacity": opacity, "symbol": symbol},
+    )
+
+
+def _bool_series(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df:
+        return pd.Series(False, index=df.index, dtype=bool)
+    return df[column].fillna(False).astype(bool)
+
+
+def _frame_outlier_mask(
+    df: pd.DataFrame,
+    value_column: str,
+    low_column: str,
+    high_column: str,
+) -> pd.Series:
+    if df.empty or value_column not in df or low_column not in df or high_column not in df:
+        return pd.Series(False, index=df.index, dtype=bool)
+    values = pd.to_numeric(df[value_column], errors="coerce")
+    low = pd.to_numeric(df[low_column], errors="coerce")
+    high = pd.to_numeric(df[high_column], errors="coerce")
+    valid_bounds = low.notna() & high.notna()
+    return valid_bounds & values.notna() & ((values < low) | (values > high))
+
+
+def _add_reference_overlay(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    low_column: str,
+    high_column: str,
+    baseline_value: object,
+    color: str,
+    label: str,
+    *,
+    row: int,
+) -> None:
+    if df.empty or low_column not in df or high_column not in df:
+        return
+    low = df[low_column].dropna()
+    high = df[high_column].dropna()
+    if low.empty or high.empty:
+        return
+    x0 = df["time_utc"].min()
+    x1 = df["time_utc"].max()
+    low_value = float(low.iloc[0])
+    high_value = float(high.iloc[0])
+    fig.add_trace(
+        go.Scattergl(
+            x=[x0, x1],
+            y=[low_value, low_value],
+            mode="lines",
+            name=f"{label} tolerance",
+            line={"color": color, "width": 1.0, "dash": "dot"},
+        ),
+        row=row,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scattergl(
+            x=[x0, x1],
+            y=[high_value, high_value],
+            mode="lines",
+            name=f"{label} tolerance",
+            showlegend=False,
+            line={"color": color, "width": 1.0, "dash": "dot"},
+        ),
+        row=row,
+        col=1,
+    )
+    if baseline_value is None or not np.isfinite(float(baseline_value)):
+        return
+    baseline = float(baseline_value)
+    fig.add_trace(
+        go.Scattergl(
+            x=[x0, x1],
+            y=[baseline, baseline],
+            mode="lines",
+            name=f"{label} reference",
+            line={"color": color, "width": 1.4, "dash": "dash"},
+        ),
+        row=row,
+        col=1,
     )
 
 
@@ -702,7 +900,7 @@ def _style_plot(
 
 
 def _baseline_source_label(source: object) -> str:
-    return "Fixed file" if str(source).lower() == "file" else "Current data"
+    return "External file" if str(source).lower() == "file" else "Not loaded"
 
 
 def _fmt(value, suffix: str, digits: int) -> str:
@@ -725,6 +923,55 @@ def main() -> None:
     turbine_id = st.sidebar.selectbox("Turbine", turbine_ids, format_func=str.upper)
     accel_dir = accelerometer_dir_for_turbine(dataset_dir, turbine_id)
     scada_dir = scada_dir_for_dataset(dataset_dir)
+    use_reference_files = st.sidebar.checkbox("Use external reference file (.mat)", value=False)
+    stored_reference_name = str(st.session_state.get("reference_file_name", ""))
+    stored_reference_path = str(st.session_state.get("reference_file_path", ""))
+    if stored_reference_name and not stored_reference_path:
+        recovered_reference_path = _recover_persisted_reference_path(stored_reference_name)
+        if recovered_reference_path:
+            stored_reference_path = recovered_reference_path
+            st.session_state["reference_file_path"] = recovered_reference_path
+    picker_nonce = int(st.session_state.get("reference_picker_nonce", 0))
+    st.sidebar.markdown("Reference file (.mat)")
+    if use_reference_files and stored_reference_name:
+        ref_name_col, ref_remove_col = st.sidebar.columns([4, 1], vertical_alignment="bottom")
+        ref_name_col.text_input(
+            "Reference file (.mat)",
+            value=stored_reference_name,
+            disabled=True,
+            label_visibility="collapsed",
+        )
+        if ref_remove_col.button("×", key="remove_reference_file", use_container_width=True):
+            st.session_state["reference_file_name"] = ""
+            st.session_state["reference_file_path"] = ""
+            st.session_state["reference_picker_nonce"] = picker_nonce + 1
+            st.rerun()
+        reference_dir = stored_reference_path or None
+    else:
+        uploaded_reference = st.sidebar.file_uploader(
+            "Reference file picker",
+            type=["mat"],
+            accept_multiple_files=False,
+            disabled=not use_reference_files,
+            label_visibility="collapsed",
+            help="Choose a MATLAB reference file.",
+            key=f"reference_file_picker_{picker_nonce}",
+        )
+        if use_reference_files and uploaded_reference is not None:
+            reference_dir, reference_name = _persist_uploaded_reference(uploaded_reference)
+            st.session_state["reference_file_name"] = reference_name
+            st.session_state["reference_file_path"] = reference_dir or ""
+            st.rerun()
+        elif use_reference_files:
+            reference_dir = None
+        else:
+            reference_dir = None
+            st.session_state["reference_file_name"] = ""
+            st.session_state["reference_file_path"] = ""
+
+    reference_ready = use_reference_files and bool(reference_dir)
+    if use_reference_files and not reference_ready:
+        st.info("Select a reference file to apply reference-based overlays and alarms. Current results stay unchanged until a file is selected.")
     st.sidebar.caption(f"Accelerometer: {accel_dir}")
     st.sidebar.caption(f"SCADA: {scada_dir}")
     period_mode = st.sidebar.selectbox("Aggregation", ["Weekly", "Daily"], index=0)
@@ -738,11 +985,26 @@ def main() -> None:
             turbine_id,
             window_minutes,
             overlap,
+            reference_dir,
+            reference_ready,
             ANALYSIS_CACHE_VERSION,
         )
     except Exception as exc:
         st.error(str(exc))
         return
+
+    if use_reference_files and stored_reference_name:
+        expected_prefix = f"REF_{turbine_id.upper()}_"
+        if not stored_reference_name.upper().startswith(expected_prefix):
+            st.warning(
+                f"Selected reference file `{stored_reference_name}` does not match the current turbine "
+                f"`{turbine_id.upper()}`. Choose a file starting with `{expected_prefix}`."
+            )
+        elif result.summary.get("reference_source") != "file":
+            st.warning(
+                f"Selected reference file `{stored_reference_name}` was not applied. "
+                "Check that the `.mat` file contains valid reference fields for this turbine."
+            )
 
     kpis = result.kpis.copy()
     kpis.index = np.arange(len(kpis))
