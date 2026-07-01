@@ -482,6 +482,95 @@ def render_drift_plot(result, df: pd.DataFrame, theme: dict[str, object], period
         st.caption(f"Reference source: {source_label}")
 
 
+def render_rms_plot(result, df: pd.DataFrame, theme: dict[str, object]) -> None:
+    required = {"rms_res_ax", "rms_res_ay", "p95_res_ax", "p95_res_ay", "p99_res_ax", "p99_res_ay"}
+    if df.empty or not required.issubset(df.columns):
+        return
+
+    stable_mask = _bool_series(df, "is_stable") if "is_stable" in df else pd.Series(True, index=df.index, dtype=bool)
+    stable = df.loc[stable_mask].copy()
+    if stable.empty:
+        return
+
+    fig = go.Figure()
+    fig.add_trace(
+        _markers(
+            stable[stable["rms_res_ax"].notna()],
+            "RMS AX",
+            "#93c5fd",
+            "rms_res_ax",
+            size=4,
+            opacity=0.2,
+            symbol="circle",
+        )
+    )
+    fig.add_trace(
+        _markers(
+            stable[stable["rms_res_ay"].notna()],
+            "RMS AY",
+            "#86efac",
+            "rms_res_ay",
+            size=4,
+            opacity=0.2,
+            symbol="diamond",
+        )
+    )
+
+    trend_ax = stable["rms_res_ax"].rolling(19, min_periods=1, center=True).mean()
+    trend_ay = stable["rms_res_ay"].rolling(19, min_periods=1, center=True).mean()
+    stable = stable.assign(ewma_res_ax=trend_ax, ewma_res_ay=trend_ay)
+
+    fig.add_trace(_line(stable, "ewma_res_ax", "AX trend", "#1d4ed8"),)
+    fig.add_trace(_line(stable, "ewma_res_ay", "AY trend", "#166534"),)
+
+    for column, label, color, dash in (
+        ("p95_res_ax", "AX P95", "#f97316", "dash"),
+        ("p95_res_ay", "AY P95", "#f59e0b", "dash"),
+        ("p99_res_ax", "AX P99.5", "#dc2626", "dot"),
+        ("p99_res_ay", "AY P99.5", "#b91c1c", "dot"),
+    ):
+        line_df = stable[["time_utc", column]].dropna()
+        if not line_df.empty:
+            fig.add_trace(_line(line_df, column, label, color, dash=dash))
+
+    ax_exceed = stable["ewma_res_ax"].notna() & stable["p95_res_ax"].notna() & (stable["ewma_res_ax"] > stable["p95_res_ax"])
+    ay_exceed = stable["ewma_res_ay"].notna() & stable["p95_res_ay"].notna() & (stable["ewma_res_ay"] > stable["p95_res_ay"])
+    fig.add_trace(
+        _markers(
+            stable.loc[ax_exceed],
+            "AX trend > P95",
+            "#f97316",
+            "ewma_res_ax",
+            size=9,
+            opacity=0.9,
+            symbol="circle",
+        )
+    )
+    fig.add_trace(
+        _markers(
+            stable.loc[ay_exceed],
+            "AY trend > P95",
+            "#dc2626",
+            "ewma_res_ay",
+            size=9,
+            opacity=0.9,
+            symbol="diamond",
+        )
+    )
+
+    _style_plot(
+        fig,
+        theme,
+        height=430,
+        margin={"l": 32, "r": 28, "t": 24, "b": 28},
+        hovermode="x unified",
+        legend={"orientation": "h", "y": -0.18},
+    )
+    fig.update_layout(title="RMS Resonance")
+    fig.update_yaxes(title_text="RMS acc (m/s^2)")
+    st.plotly_chart(fig, width="stretch")
+
+
 def render_psd(result, df: pd.DataFrame, theme: dict[str, object]) -> None:
     if df.empty:
         return
@@ -1015,6 +1104,9 @@ def main() -> None:
 
     render_summary(result, filtered, period_mode)
     render_drift_plot(result, filtered, theme, period_mode)
+
+    st.subheader("RMS")
+    render_rms_plot(result, filtered, theme)
 
     st.subheader("PSD")
     render_psd(result, filtered, theme)
